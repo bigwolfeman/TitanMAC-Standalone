@@ -45,3 +45,4 @@ checkpoints/*.pt
 .env
 .env.local
 
+checkpoints/math_model.pt

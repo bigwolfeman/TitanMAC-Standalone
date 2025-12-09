@@ -275,6 +275,7 @@ class TitanMAC(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
+            # UNCOMMENT THIS CODE IF YOUR DATA ISN'T PRE-SHIFTED:
             # Standard causal LM shift: predict next token
             # logits[i] predicts labels[i+1], so we align:
             #   shift_logits = logits[:, :-1, :]  (positions 0..T-2)
@@ -392,6 +393,7 @@ class TitanMAC(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
+            # UNCOMMENT THIS CODE IF YOUR DATA ISN'T PRE-SHIFTED:
             # Standard causal LM shift: predict next token
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -506,6 +508,7 @@ class TitanMAC(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
+            # UNCOMMENT THIS CODE IF YOUR DATA ISN'T PRE-SHIFTED:
             # Standard causal LM shift: predict next token
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -642,6 +645,7 @@ class TitanMAC(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
+            # UNCOMMENT THIS CODE IF YOUR DATA ISN'T PRE-SHIFTED:
             # Standard causal LM shift: predict next token
             # logits[i] predicts labels[i+1], so we align:
             #   shift_logits = logits[:, :-1, :]  (positions 0..T-2)
