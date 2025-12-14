@@ -46,3 +46,6 @@ checkpoints/*.pt
 .env.local
 
 checkpoints/math_model.pt
+
+# Documentation
+docs/nested-learning/NestedOptimizer-Port-Guide.md
