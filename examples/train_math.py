@@ -5,8 +5,16 @@ Example training script for TitanMAC on generated math data.
 Uses StarCoder2 tokenizer and generates arithmetic problems for training.
 This demonstrates how to use the TitanMAC architecture standalone.
 
+Supports two optimizer modes:
+- Adam/AdamW: Standard optimizer (default)
+- Nested: DeepNestedOptimizer implementing Nested Learning (NeurIPS 2025)
+
 Usage:
+    # Standard training with AdamW
     python examples/train_math.py --steps 1000 --batch-size 4
+
+    # Training with Nested Learning optimizer
+    python examples/train_math.py --steps 1000 --optimizer nested --meta-lr 1e-4
 """
 
 import argparse
@@ -165,13 +173,14 @@ def generate_sample(
 def train(
     model: nn.Module,
     dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
+    optimizer,  # Can be torch.optim.Optimizer or DeepNestedOptimizer
     device: torch.device,
     tokenizer,
     max_steps: int,
     log_interval: int = 10,
     sample_interval: int = 40,
     grad_accum_steps: int = 1,
+    use_nested_optimizer: bool = False,
 ):
     """Training loop with periodic sample generation."""
     model.train()
@@ -180,6 +189,9 @@ def train(
     step = 0
     accum_step = 0
     start_time = time.time()
+
+    # Track nested optimizer metrics
+    nested_metrics = {'lr_mults': [], 'meta_loss': None}
 
     # Test prompts for generation (no trailing space - model predicts space then digit)
     test_prompts = [
@@ -208,10 +220,18 @@ def train(
 
         # Optimizer step
         if accum_step >= grad_accum_steps:
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Gradient clipping (nested optimizer does this internally)
+            if not use_nested_optimizer:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            optimizer.step()
+            # Step with loss value for nested optimizer
+            if use_nested_optimizer:
+                result = optimizer.step(total_loss / grad_accum_steps)
+                nested_metrics['lr_mults'] = result.get('lr_multipliers', [])
+                nested_metrics['meta_loss'] = optimizer.last_meta_loss
+            else:
+                optimizer.step()
+
             optimizer.zero_grad()
 
             step += 1
@@ -223,11 +243,19 @@ def train(
                 elapsed = time.time() - start_time
                 tokens_per_sec = (log_interval * input_ids.numel()) / elapsed
 
-                print(
+                log_str = (
                     f"Step {step:5d} | "
                     f"Loss: {avg_loss:.4f} | "
                     f"Tokens/s: {tokens_per_sec:.0f}"
                 )
+
+                # Add nested optimizer metrics
+                if use_nested_optimizer and len(nested_metrics['lr_mults']) > 0:
+                    lr_mults = nested_metrics['lr_mults']
+                    lr_str = ", ".join(f"{m:.3f}" for m in lr_mults.tolist())
+                    log_str += f" | LR mults: [{lr_str}]"
+
+                print(log_str)
 
                 total_loss = 0.0
                 start_time = time.time()
@@ -288,6 +316,16 @@ def main():
     # Device
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
+    # Optimizer selection (Nested Learning support)
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "nested"],
+                        help="Optimizer: 'adam' (AdamW) or 'nested' (DeepNestedOptimizer)")
+    parser.add_argument("--meta-lr", type=float, default=1e-4,
+                        help="Meta-learning rate for nested optimizer")
+    parser.add_argument("--meta-update-freq", type=int, default=50,
+                        help="Meta-update frequency for nested optimizer")
+    parser.add_argument("--cms-frequencies", type=str, default="1,10,100",
+                        help="CMS update frequencies (comma-separated)")
+
     args = parser.parse_args()
 
     print("=" * 60)
@@ -340,11 +378,32 @@ def main():
     )
 
     # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=0.01,
-    )
+    use_nested_optimizer = args.optimizer == "nested"
+
+    if use_nested_optimizer:
+        from titans_core.opt import DeepNestedOptimizer
+        cms_freqs = [int(x) for x in args.cms_frequencies.split(",")]
+        optimizer = DeepNestedOptimizer(
+            model=model,
+            base_lr=args.lr,
+            meta_lr=args.meta_lr,
+            cms_frequencies=cms_freqs,
+            mode='simple',
+            meta_update_freq=args.meta_update_freq,
+            weight_decay=0.01,
+            max_grad_norm=1.0,
+        )
+        print(f"\nUsing DeepNestedOptimizer (Nested Learning)")
+        print(f"  Meta LR: {args.meta_lr}")
+        print(f"  Meta update freq: {args.meta_update_freq}")
+        print(f"  CMS frequencies: {cms_freqs}")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.01,
+        )
+        print(f"\nUsing AdamW optimizer")
 
     # Train
     print(f"\nTraining for {args.steps} steps on {args.device}...")
@@ -362,19 +421,36 @@ def main():
         log_interval=args.log_interval,
         sample_interval=40,
         grad_accum_steps=args.grad_accum,
+        use_nested_optimizer=use_nested_optimizer,
     )
 
     # Save checkpoint
-    checkpoint_path = Path(__file__).parent.parent / "checkpoints" / "math_model.pt"
+    checkpoint_name = "math_model_nested.pt" if use_nested_optimizer else "math_model.pt"
+    checkpoint_path = Path(__file__).parent.parent / "checkpoints" / checkpoint_name
     checkpoint_path.parent.mkdir(exist_ok=True)
 
-    torch.save({
+    checkpoint = {
         "model_state_dict": model.state_dict(),
         "config": config.to_dict(),
         "step": args.steps,
-    }, checkpoint_path)
+        "optimizer_type": args.optimizer,
+    }
+
+    # Save optimizer state
+    if use_nested_optimizer:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+        checkpoint["lr_multipliers"] = optimizer.get_lr_multipliers().tolist()
+    else:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+
+    torch.save(checkpoint, checkpoint_path)
 
     print(f"\nCheckpoint saved to: {checkpoint_path}")
+
+    # Print final nested optimizer stats
+    if use_nested_optimizer:
+        lr_mults = optimizer.get_lr_multipliers()
+        print(f"Final LR multipliers: {lr_mults.tolist()}")
 
 
 if __name__ == "__main__":
