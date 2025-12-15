@@ -49,3 +49,10 @@ checkpoints/math_model.pt
 
 # Documentation
 docs/nested-learning/NestedOptimizer-Port-Guide.md
+results/adam_seed42_loss.txt
+.gitignore
+results/nested_seed42_loss.txt
+results/nested_seed456_loss.txt
+results/adamw_baseline_loss.txt
+.gitignore
+results/nested_seed123_loss.txt
