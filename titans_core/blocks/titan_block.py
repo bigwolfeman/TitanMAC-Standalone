@@ -8,6 +8,7 @@ from ..config import TitanMACConfig
 from .norms import RMSNorm
 from .mlp import MLPBlock
 from ..attn.windowed_attention import WindowedAttention
+from ..attn.block_sparse_attention import BlockSparseAttention
 
 
 class TitanBlock(nn.Module):
@@ -17,6 +18,10 @@ class TitanBlock(nn.Module):
     Architecture (pre-norm):
         1. Attention: x = x + Attention(RMSNorm(x))
         2. MLP: x = x + MLP(RMSNorm(x))
+
+    Attention options:
+        - use_block_sparse=False: O(T²) WindowedAttention (legacy)
+        - use_block_sparse=True: O(T*w) BlockSparseAttention (paper-faithful)
 
     Args:
         config: TitanMACConfig with architecture parameters
@@ -42,8 +47,21 @@ class TitanBlock(nn.Module):
         self.norm_attn = RMSNorm(config.d_model, eps=config.norm_eps)
         self.norm_mlp = RMSNorm(config.d_model, eps=config.norm_eps)
 
-        # Attention block
-        self.attention = WindowedAttention(config)
+        # Attention block - choose implementation based on config
+        if getattr(config, 'use_block_sparse', False):
+            # Paper-faithful O(T*w) block-sparse attention
+            self.attention = BlockSparseAttention(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                window_size=config.window_size,
+                block_size=getattr(config, 'block_size', 64),
+                n_persistent=config.n_persistent,
+                dropout=config.attention_dropout,
+                causal=config.causal,
+            )
+        else:
+            # Legacy O(T²) windowed attention
+            self.attention = WindowedAttention(config)
 
         # MLP block
         self.mlp = MLPBlock(

@@ -112,11 +112,12 @@ class TitanMAC(nn.Module):
             self.memory_bank = None
 
         # Neural Long-Term Memory (Titans paper, Section 3.1)
+        # PAPER-FAITHFUL: Memory M is a deep MLP, updated via GD at test time
         if config.use_neural_memory:
             self.neural_memory = NeuralMemory(
                 d_model=config.d_model,
                 d_memory=config.d_memory if config.d_memory is not None else config.d_model,
-                capacity=config.memory_capacity,
+                n_memory_layers=config.n_memory_layers,  # Paper: L_M >= 2
                 theta_lr=config.memory_theta_lr,
                 forget_hidden=config.memory_forget_hidden,
                 decay_hidden=config.memory_decay_hidden,
@@ -165,12 +166,18 @@ class TitanMAC(nn.Module):
         """
         Forward pass with MAC (Memory as Context) dataflow.
 
-        Implements Titans Equation 16:
-            h_t = M*_{t-1}(q_t)                    # Memory retrieval (stop-grad)
-            S_tilde = [p_1...p_np] || h_t || S_t   # Concatenate
-            y_t = Attn(S_tilde)                    # Attention
-            M_t = M_{t-1}(y_t)                     # Update memory
-            o_t = y_t * sigmoid(M*_t(y_t))         # Gated output
+        PAPER-FAITHFUL IMPLEMENTATION (Section 4.1):
+        Processes sequence in SEGMENTS to ensure memory tokens are reachable.
+
+        For each segment S^(i):
+            h = M*_{t-1}(q)                       # Retrieve N_l memory tokens
+            S̃ = [p_1...p_np] || h || S^(i)       # Concat: persistent, memory, segment
+            y = Attn(S̃)                          # Attention over combined
+            M_t = M_{t-1}(y_segment)              # Update memory with segment output
+            o = y * sigmoid(M*_t(y))              # Gated output
+
+        This ensures memory tokens (N_l) are adjacent to segment tokens,
+        so attention window can reach them.
 
         Args:
             input_ids: Input token IDs [B, T]
@@ -184,7 +191,7 @@ class TitanMAC(nn.Module):
                 - "memory_loss": scalar memory update loss
         """
         if self.neural_memory is None:
-            raise ValueError("forward_with_memory requires use_neural_memory=True")
+            raise ValueError("forward_mac requires use_neural_memory=True")
 
         B, T = input_ids.shape
         device = input_ids.device
@@ -192,80 +199,96 @@ class TitanMAC(nn.Module):
         # Token embeddings
         x = self.embed_tokens(input_ids)  # [B, T, d_model]
 
-        # Prepend persistent tokens and add position embeddings
+        # Add position embeddings
+        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        pos_emb = self.embed_positions(positions)
+        x = x + pos_emb  # [B, T, d_model]
+
+        # Get persistent tokens
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            # Position embeddings only for input sequence (not persistent tokens)
-            positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = self.embed_positions(positions)
-            x = x + pos_emb
-
-            # Prepend persistent tokens
             persistent = self.persistent_tokens.unsqueeze(0).expand(B, -1, -1)
+            n_persistent = self.config.n_persistent
         else:
-            # No persistent tokens - standard behavior
-            positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = self.embed_positions(positions)
-            x = x + pos_emb
             persistent = None
+            n_persistent = 0
 
-        # 1. Memory retrieval (stop-gradient) - T041
-        h = self.neural_memory.retrieve(x)  # [B, T, d_memory]
-        h_proj = self.memory_proj(h)  # [B, T, d_model]
+        # Segment processing parameters
+        segment_size = self.config.segment_size
+        n_memory_tokens = self.config.n_memory_tokens
 
-        # 2. MAC dataflow concatenation: [persistent | memory | sequence] - T041
-        if persistent is not None:
-            x_combined = torch.cat([persistent, h_proj, x], dim=1)
-            # [B, n_persistent + T + T, d_model]
-        else:
-            x_combined = torch.cat([h_proj, x], dim=1)
-            # [B, 2*T, d_model]
+        # Process sequence in segments
+        num_segments = (T + segment_size - 1) // segment_size
 
-        # 3. Pass through Titan blocks (attention over combined sequence)
-        y = x_combined
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(hidden_states):
-                        return module(hidden_states, attn_mask=None)
-                    return custom_forward
-                y = checkpoint(create_custom_forward(layer), y, use_reentrant=False)
+        # PERF: Pre-allocate output tensor instead of list.append + torch.cat
+        o = torch.empty(B, T, self.config.d_model, device=device, dtype=x.dtype)
+
+        # PERF: Use tensor accumulator for memory loss (avoids Python float)
+        memory_loss_accum = torch.zeros(1, device=device, dtype=x.dtype)
+
+        for seg_idx in range(num_segments):
+            seg_start = seg_idx * segment_size
+            seg_end = min(seg_start + segment_size, T)
+            segment = x[:, seg_start:seg_end, :]  # [B, seg_len, d_model]
+            seg_len = seg_end - seg_start
+
+            # 1. Memory retrieval: get N_l memory tokens for this segment
+            # Use segment mean as query to get representative memory
+            seg_query = segment.mean(dim=1, keepdim=True)  # [B, 1, d_model]
+            seg_query = seg_query.expand(B, n_memory_tokens, -1)  # [B, N_l, d_model]
+
+            # Retrieve memory (paper: h_t = M*_{t-1}(q_t))
+            h = self.neural_memory.retrieve(seg_query)  # [B, N_l, d_memory]
+            h_proj = self.memory_proj(h)  # [B, N_l, d_model]
+
+            # 2. Concatenate: [persistent | memory | segment]
+            # This ensures memory tokens are adjacent to segment tokens
+            if persistent is not None:
+                segment_combined = torch.cat([persistent, h_proj, segment], dim=1)
+                # [B, n_persistent + N_l + seg_len, d_model]
             else:
-                y = layer(y, attn_mask=None)
+                segment_combined = torch.cat([h_proj, segment], dim=1)
+                # [B, N_l + seg_len, d_model]
 
-        # 4. Update memory with sequence part (skip persistent and memory retrieval)
-        # Extract the original sequence region from y
-        if persistent is not None:
-            seq_start = self.config.n_persistent + T
-            y_seq = y[:, seq_start:, :]  # [B, T, d_model]
-        else:
-            y_seq = y[:, T:, :]  # [B, T, d_model]
+            # 3. Pass through Titan blocks
+            y = segment_combined
+            for layer in self.layers:
+                if self.gradient_checkpointing and self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(hidden_states):
+                            return module(hidden_states, attn_mask=None)
+                        return custom_forward
+                    y = checkpoint(create_custom_forward(layer), y, use_reentrant=False)
+                else:
+                    y = layer(y, attn_mask=None)
 
-        # Memory update - T043, T044
-        # Only update if training or test-time memory enabled
-        if self.training or self.config.enable_test_time_memory:
-            memory_loss = self.neural_memory.update(y_seq)
-        else:
-            # In eval mode without test-time memory, just compute loss without update
-            memory_loss = self.neural_memory.compute_loss(y_seq)
+            # 4. Extract segment output (skip persistent + memory tokens)
+            seg_output_start = n_persistent + n_memory_tokens
+            y_segment = y[:, seg_output_start:, :]  # [B, seg_len, d_model]
 
-        # 5. Gated output: o = y * sigmoid(M*(y)) - T041
-        gate_values = self.neural_memory.retrieve(y)  # [B, seq_len, d_memory]
-        gate_proj = self.gate_proj(gate_values)  # [B, seq_len, d_model]
-        gate = torch.sigmoid(gate_proj)  # Bounded to [0, 1]
-        o = y * gate
+            # 5. Update memory with segment output
+            if self.training or self.config.enable_test_time_memory:
+                seg_memory_loss = self.neural_memory.update(y_segment)
+            else:
+                seg_memory_loss = self.neural_memory.compute_loss(y_segment)
+            # PERF: Accumulate in tensor (no Python float conversion)
+            memory_loss_accum.add_(seg_memory_loss)
+
+            # 6. Gated output: o = y * sigmoid(M*(y))
+            gate_values = self.neural_memory.retrieve(y_segment)  # [B, seg_len, d_memory]
+            gate_proj = self.gate_proj(gate_values)  # [B, seg_len, d_model]
+            gate = torch.sigmoid(gate_proj)
+
+            # PERF: Write directly to pre-allocated output
+            o[:, seg_start:seg_end, :] = y_segment * gate  # [B, seg_len, d_model]
+
+        # Average memory loss over segments (squeeze to scalar tensor)
+        memory_loss = (memory_loss_accum / num_segments).squeeze()
 
         # Final normalization
         o = self.norm(o)
 
-        # LM head - only on the original sequence positions
-        if persistent is not None:
-            # Extract logits for original sequence (skip persistent + memory retrieval)
-            seq_start = self.config.n_persistent + T
-            o_seq = o[:, seq_start:, :]  # [B, T, d_model]
-        else:
-            o_seq = o[:, T:, :]  # [B, T, d_model]
-
-        logits = self.lm_head(o_seq)  # [B, T, vocab_size]
+        # LM head
+        logits = self.lm_head(o)  # [B, T, vocab_size]
 
         # Prepare output
         output = {
@@ -275,15 +298,9 @@ class TitanMAC(nn.Module):
 
         # Compute loss if labels provided
         if labels is not None:
-            # UNCOMMENT THIS CODE IF YOUR DATA ISN'T PRE-SHIFTED:
-            # Standard causal LM shift: predict next token
-            # logits[i] predicts labels[i+1], so we align:
-            #   shift_logits = logits[:, :-1, :]  (positions 0..T-2)
-            #   shift_labels = labels[:, 1:]      (positions 1..T-1)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            # Flatten for cross-entropy (ignore_index=-100 for padding)
             ce_loss = F.cross_entropy(
                 shift_logits.reshape(-1, self.config.vocab_size),
                 shift_labels.reshape(-1),
@@ -291,7 +308,6 @@ class TitanMAC(nn.Module):
                 ignore_index=-100,
             )
             output["ce_loss"] = ce_loss
-            # Total loss = CE loss + memory loss (for gradient flow through memory)
             output["loss"] = ce_loss + memory_loss
 
         return output
@@ -305,11 +321,14 @@ class TitanMAC(nn.Module):
         """
         Forward pass with MAG (Memory as Gate) dataflow.
 
-        Memory gates the attention output instead of being concatenated:
-            y_t = Attn(x_t)                        # Standard attention
-            g_t = sigmoid(M*_t(y_t))               # Memory-based gating
-            o_t = y_t * g_t                        # Gated output
-            M_t = M_{t-1}(y_t)                     # Update memory
+        PAPER-FAITHFUL (Section 4.2, Eq. 26-28):
+            x̃ = [p_1...p_np] || x                  # Persistent + input
+            y = SW-Attn*(x̃)                        # Sliding window attention
+            g = M(x̃)                               # Memory gate from INPUT (not output!)
+            o = y * g                              # Gated output
+            M_t = M_{t-1}(y)                       # Update memory
+
+        Key difference from old implementation: gate uses INPUT x, not attention output y.
 
         Args:
             input_ids: Input token IDs [B, T]
@@ -331,21 +350,26 @@ class TitanMAC(nn.Module):
         # Token embeddings
         x = self.embed_tokens(input_ids)  # [B, T, d_model]
 
-        # Prepend persistent tokens and add position embeddings
+        # Add position embeddings
+        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        pos_emb = self.embed_positions(positions)
+        x = x + pos_emb
+
+        # Prepend persistent tokens
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = self.embed_positions(positions)
-            x = x + pos_emb
-
             persistent = self.persistent_tokens.unsqueeze(0).expand(B, -1, -1)
-            x = torch.cat([persistent, x], dim=1)  # [B, n_persistent + T, d_model]
+            x_combined = torch.cat([persistent, x], dim=1)  # [B, n_persistent + T, d_model]
         else:
-            positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = self.embed_positions(positions)
-            x = x + pos_emb
+            x_combined = x
 
-        # Pass through Titan blocks (standard attention)
-        y = x
+        # PAPER-FAITHFUL: Compute gate from INPUT (not attention output)
+        # Paper Eq. 28: o = y ⊗ M(x̃) where x̃ = [persistent || input]
+        gate_values = self.neural_memory.retrieve(x_combined)  # [B, seq_len, d_memory]
+        gate_proj = self.gate_proj(gate_values)  # [B, seq_len, d_model]
+        gate = torch.sigmoid(gate_proj)  # [B, seq_len, d_model]
+
+        # Pass through Titan blocks (sliding window attention)
+        y = x_combined
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
@@ -356,19 +380,16 @@ class TitanMAC(nn.Module):
             else:
                 y = layer(y, attn_mask=None)
 
+        # MAG: Gate the attention output with memory-based gate
+        o = y * gate  # [B, seq_len, d_model]
+
         # Extract sequence region for memory update
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
             y_seq = y[:, self.config.n_persistent:, :]  # [B, T, d_model]
         else:
-            y_seq = y  # [B, T, d_model]
+            y_seq = y
 
-        # MAG: Memory gates the output
-        gate_values = self.neural_memory.retrieve(y)  # [B, seq_len, d_memory]
-        gate_proj = self.gate_proj(gate_values)  # [B, seq_len, d_model]
-        gate = torch.sigmoid(gate_proj)  # Bounded to [0, 1]
-        o = y * gate  # Gated output
-
-        # Update memory with sequence part
+        # Update memory with attention output
         if self.training or self.config.enable_test_time_memory:
             memory_loss = self.neural_memory.update(y_seq)
         else:

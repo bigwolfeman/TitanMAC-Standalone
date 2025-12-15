@@ -88,6 +88,8 @@ class TitanMACConfig:
     # Attention configuration
     window_size: int = 512
     n_persistent: int = 16
+    use_block_sparse: bool = True  # Use O(T*w) block-sparse attention (paper-faithful)
+    block_size: int = 64  # Block size for block-sparse attention
 
     # Regularization
     dropout: float = 0.0
@@ -116,19 +118,31 @@ class TitanMACConfig:
 
     # =========================================================================
     # Titans Neural Memory (arxiv 2501.00663, Section 3.1)
+    # PAPER-FAITHFUL: Memory M is a deep MLP, not an embedding table.
+    # The MLP weights ARE the memory, updated via GD at test time.
     # =========================================================================
     use_neural_memory: bool = False  # Enable gradient-based neural long-term memory
-    memory_capacity: int = 512  # Number of memory slots (M ∈ R^{capacity × d_memory})
+    n_memory_layers: int = 2  # Number of layers in memory MLP (paper: L_M >= 2)
     d_memory: Optional[int] = None  # Memory dimension (defaults to d_model if None)
     memory_theta_lr: float = 0.01  # Learning rate for memory updates (θ_t in S_t)
     memory_forget_hidden: int = 32  # Hidden dim for forget gate MLP (α_t)
     memory_decay_hidden: int = 32  # Hidden dim for decay gate MLP (η_t)
+    # Legacy parameter - kept for compatibility but ignored
+    memory_capacity: int = 512  # DEPRECATED: MLP memory doesn't use capacity
 
     # =========================================================================
-    # Titans Architecture Variant (Section 3.2)
+    # Titans Architecture Variant (Section 4)
     # =========================================================================
     titans_variant: str = "MAC"  # Architecture variant: "MAC", "MAG", or "MAL"
     use_parallel_memory: bool = True  # Use parallel memory update (Eq. 11-13)
+
+    # =========================================================================
+    # MAC Segment Processing (Section 4.1)
+    # PAPER-FAITHFUL: Process sequence in segments with fixed N_l memory tokens
+    # This ensures memory tokens are reachable within the attention window.
+    # =========================================================================
+    segment_size: int = 512  # Size of each segment for MAC processing
+    n_memory_tokens: int = 32  # Number of memory tokens retrieved per segment (N_l)
 
     # =========================================================================
     # Nested Learning: Deep Momentum Gradient Descent (DMGD)
@@ -248,9 +262,15 @@ class TitanMACConfig:
         # Validate Titans Neural Memory parameters
         # =====================================================================
         if self.use_neural_memory:
-            if self.memory_capacity <= 0:
+            if self.n_memory_layers < 1:
                 raise ValueError(
-                    f"memory_capacity must be positive, got {self.memory_capacity}"
+                    f"n_memory_layers must be >= 1, got {self.n_memory_layers}"
+                )
+            if self.n_memory_layers < 2:
+                import warnings
+                warnings.warn(
+                    "Paper recommends n_memory_layers >= 2 for better expressivity. "
+                    f"Got {self.n_memory_layers}."
                 )
             if self.d_memory is not None and self.d_memory <= 0:
                 raise ValueError(f"d_memory must be positive, got {self.d_memory}")
@@ -333,7 +353,7 @@ class TitanMACConfig:
             f"titans_variant='{self.titans_variant}'",
         ]
         if self.use_neural_memory:
-            parts.append(f"memory_capacity={self.memory_capacity}")
+            parts.append(f"n_memory_layers={self.n_memory_layers}")
         if self.use_dmgd:
             parts.append("use_dmgd=True")
         if self.use_cms:
