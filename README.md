@@ -1,8 +1,16 @@
 # TitanMAC: Memory-Augmented Transformer
 
-Standalone implementation of the TitanMAC architecture based on:
-- **Titans paper** (arxiv 2501.00663): Neural Long-Term Memory
-- **Nested Learning** (NeurIPS 2025): DMGD and CMS
+Standalone implementation of the TitanMAC architecture combining neural long-term memory with nested learning optimization.
+
+## Foundational Papers
+
+| Paper | Link | Key Contribution |
+|-------|------|------------------|
+| **Titans: Learning to Memorize at Test Time** | [arXiv:2501.00663](https://arxiv.org/abs/2501.00663) | Neural long-term memory module, MAC/MAG/MAL variants, surprise-based updates |
+| **Titans Revisited** | [arXiv:2510.09551](https://arxiv.org/abs/2510.09551) | Lightweight reimplementation, empirical validation across domains |
+| **Titans & MIRAS Blog** | [Google Research](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/) | Unified framework viewing attention as associative memory |
+| **It's All Connected (MIRAS)** | [arXiv:2504.13173](https://arxiv.org/abs/2504.13173) | MIRAS framework, attentional bias, retention regularization, MONETA/YAAD/MEMORA variants |
+| **Nested Learning** | [Google Research](https://research.google/blog/introducing-nested-learning-a-new-ml-paradigm-for-continual-learning/) | DMGD, CMS, multi-frequency updates, continual learning paradigm |
 
 ## Features
 
