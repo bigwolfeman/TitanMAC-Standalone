@@ -10,7 +10,13 @@ Implements Nested Learning (NeurIPS 2025):
 from .continuum_optimizer import ContinuumOptimizer
 from .nested_controller import NestedController
 from .param_groups import group_titans_params, infer_param_depth
-from .deep_nested_optimizer import DeepNestedOptimizer, L2RegressionMomentum, ContinuumMemoryState
+from .deep_nested_optimizer import (
+    DeepNestedOptimizer,
+    L2RegressionMomentum,
+    DirectUpdateMLP,
+    ContinuumMemoryState,
+    preprocess_gradient,
+)
 from .dmgd import DMGDOptimizer, MomentumMLP
 from .cms import ContinuumMemorySystem
 from .meta_trainer import UnrolledMetaTrainer, SimplifiedMetaTrainer, create_meta_trainer
@@ -19,7 +25,9 @@ __all__ = [
     # New unified optimizer (recommended)
     "DeepNestedOptimizer",
     "L2RegressionMomentum",
+    "DirectUpdateMLP",
     "ContinuumMemoryState",
+    "preprocess_gradient",
     # Meta-learning
     "UnrolledMetaTrainer",
     "SimplifiedMetaTrainer",

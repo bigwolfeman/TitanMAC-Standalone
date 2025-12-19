@@ -1,5 +1,5 @@
 """
-DeepNestedOptimizer: Complete Nested Learning optimizer.
+DeepNestedOptimizer: Complete Nested Learning optimizer for MoE models.
 
 Implements the Nested Learning paradigm from NeurIPS 2025:
 - Deep Momentum Gradient Descent (DMGD) with L2 regression loss
@@ -17,32 +17,75 @@ Key features:
 - GradScaler compatible for mixed-precision training
 """
 
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING
+import math
 import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 
 from .nested_controller import NestedController
-from .param_groups import group_titans_params, infer_param_depth
+from .param_groups import group_moe_params, infer_param_depth
 from .meta_trainer import SimplifiedMetaTrainer, UnrolledMetaTrainer
+
+
+def preprocess_gradient(g: Tensor, p: float = 10.0) -> Tuple[Tensor, Tensor]:
+    """
+    Log-sign preprocessing from Andrychowicz et al. 2016.
+
+    This preprocessing is critical for learned optimizers because:
+    1. Raw gradients can vary by many orders of magnitude
+    2. MLPs struggle with such wide dynamic ranges
+    3. Log-sign encoding compresses the range while preserving sign information
+
+    The encoding produces two features per gradient element:
+    - log_g: log(|g|)/p if |g| >= exp(-p), else -1 (indicating "small")
+    - sign_g: sign(g) if |g| >= exp(-p), else exp(p)*g (smooth transition)
+
+    Args:
+        g: Gradient tensor (any shape)
+        p: Precision parameter (default 10.0). Higher p = more precision for small values.
+
+    Returns:
+        log_g: Log-magnitude features, same shape as g
+        sign_g: Sign features, same shape as g
+    """
+    abs_g = g.abs()
+    # Use Python math.exp to avoid GPU->CPU sync from torch.tensor creation
+    # exp(-10) ≈ 4.5e-5, so values smaller than this are "small"
+    threshold = math.exp(-p)
+    exp_p = math.exp(p)
+
+    # For |g| >= threshold: use log encoding
+    # For |g| < threshold: use linear encoding (smooth near zero)
+    log_g = torch.where(
+        abs_g >= threshold,
+        torch.log(abs_g) / p,  # Normalized log (in range [-1, ~1] for typical gradients)
+        torch.full_like(g, -1.0)  # Indicator for "small"
+    )
+    sign_g = torch.where(
+        abs_g >= threshold,
+        g.sign(),  # Just the sign
+        exp_p * g  # Linear scaling for small values (scalar * tensor is efficient)
+    )
+    return log_g, sign_g
 
 
 class L2RegressionMomentum(nn.Module):
     """
     Learned momentum with L2 regression internal objective.
 
-    Replaces linear momentum (v = β*v + g) with a neural network:
-    v = MLP(concat(g, v_prev)) trained to minimize ||predicted - actual_improvement||²
+    Replaces linear momentum (v = beta*v + g) with a neural network:
+    v = MLP(concat(g, v_prev)) trained to minimize ||predicted - actual_improvement||^2
 
     The key insight from Nested Learning: momentum is associative memory
     mapping gradient keys to update values. L2 regression provides a more
     robust learning signal than dot-product similarity.
 
     Args:
-        input_dim: Dimension of gradients/momentum (flattened)
         hidden_dim: Hidden layer dimension
         num_layers: Number of hidden layers (default: 2)
 
@@ -91,16 +134,25 @@ class L2RegressionMomentum(nn.Module):
             # Output layer: initialize to produce reasonable defaults
             output_layer = self.net[-1]
             nn.init.zeros_(output_layer.weight)
-            # Bias: sigmoid(0.8)≈0.69 -> scale≈1.38, tanh(1.0)≈0.76 -> shift≈0.76
-            output_layer.bias.data = torch.tensor([0.8, 1.0, -2.0])
+            # Target: scale~0.9, shift~1.0 (CRITICAL!), damping~0.0
+            # Standard momentum: v = 0.9*v + 1.0*g, update = v
+            #
+            # scale = sigmoid(x)*0.49+0.5 → for 0.9: x=1.5
+            # shift = tanh(x) → for ~1.0: x=3.0 gives tanh(3)=0.995
+            # damping = sigmoid(x) → for ~0.0: x=-5.0 gives sigmoid(-5)=0.007
+            #
+            # The previous shift=0.1 was WRONG - it made updates 11x smaller!
+            output_layer.bias.data = torch.tensor([1.5, 3.0, -5.0])
 
     def compute_stats(self, tensor: Tensor) -> Tensor:
         """Compute statistics [mean, std, norm] for a tensor."""
         with torch.no_grad():
             mean = tensor.mean()
-            std = tensor.std() if tensor.numel() > 1 else torch.tensor(0.0, device=tensor.device)
+            # Use tensor.new_tensor to avoid separate device/dtype specification
+            std = tensor.std() if tensor.numel() > 1 else tensor.new_tensor(0.0)
             norm = tensor.norm()
-        return torch.stack([mean, std, norm])
+            # Keep stack inside no_grad to avoid accidental gradient tracking
+            return torch.stack([mean, std, norm])
 
     def forward(
         self,
@@ -132,7 +184,8 @@ class L2RegressionMomentum(nn.Module):
         out = self.net(x)
 
         # Transform to bounded ranges
-        scale = torch.sigmoid(out[0]) * 1.0 + 0.5  # [0.5, 1.5]
+        # CRITICAL: scale must be < 1.0 for momentum stability
+        scale = torch.sigmoid(out[0]) * 0.49 + 0.5  # [0.5, 0.99]
         shift = torch.tanh(out[1])  # [-1, 1]
         damping = torch.sigmoid(out[2])  # [0, 1]
 
@@ -151,9 +204,134 @@ class L2RegressionMomentum(nn.Module):
             actual_improvement: param_{t+k} - param_t (what actually helped)
 
         Returns:
-            L2 loss: ||predicted - actual||²
+            L2 loss: ||predicted - actual||^2
         """
         return torch.nn.functional.mse_loss(predicted_update, actual_improvement)
+
+
+class DirectUpdateMLP(nn.Module):
+    """
+    Per-element update MLP following Andrychowicz et al. 2016.
+
+    Key differences from L2RegressionMomentum:
+    1. Uses gradient preprocessing (log-sign encoding)
+    2. Operates on per-element features, not summary statistics
+    3. Outputs direct update tensor, not scalar coefficients
+
+    For efficiency, we:
+    1. Flatten gradients to 1D
+    2. Stack features along a new dimension: [N, 4] for [log_g, sign_g, log_m, sign_m]
+    3. Process through MLP that outputs [N, 1]
+    4. Reshape back to original gradient shape
+
+    The MLP is shared across all elements (coordinate-wise), making it
+    parameter-efficient regardless of model size.
+
+    Args:
+        hidden_dim: Hidden layer dimension (default: 20, small as per paper)
+        num_layers: Number of hidden layers (default: 2)
+        use_momentum: Whether to include momentum features (default: True)
+
+    Architecture:
+        Input: 4 features per element [log_g, sign_g, log_m, sign_m]
+        Hidden: num_layers x hidden_dim with SiLU activation
+        Output: 1 value per element (the update)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 20,
+        num_layers: int = 2,
+        use_momentum: bool = True,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.use_momentum = use_momentum
+
+        # Input: [log_g, sign_g] + optionally [log_m, sign_m]
+        input_dim = 4 if use_momentum else 2
+
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+
+        # Output: 1 value per element
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize to approximate SGD at start (output ≈ gradient magnitude * sign)."""
+        with torch.no_grad():
+            # Standard initialization for hidden layers
+            for module in self.net:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+            # Initialize output layer to approximate: output ≈ sign_g * exp(log_g * p)
+            # This makes initial updates close to the raw gradient
+            # Input features are [log_g, sign_g, log_m, sign_m]
+            # We want output ≈ sign_g * 0.1 (conservative start, but not zero)
+            output_layer = self.net[-1]
+            nn.init.zeros_(output_layer.weight)
+            # Set weight for sign_g feature (index 1) to produce reasonable output
+            output_layer.weight.data[0, 1] = 0.1  # output ≈ 0.1 * sign_g
+            nn.init.zeros_(output_layer.bias)
+
+    def forward(
+        self,
+        grad: Tensor,
+        prev_momentum: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Compute per-element update from preprocessed gradient features.
+
+        Args:
+            grad: Current gradient tensor (any shape)
+            prev_momentum: Previous momentum tensor (same shape as grad), optional
+
+        Returns:
+            update: Update tensor (same shape as grad)
+        """
+        original_shape = grad.shape
+        grad_flat = grad.flatten()
+        n_elements = grad_flat.numel()
+
+        # Preprocess gradient
+        log_g, sign_g = preprocess_gradient(grad_flat)
+
+        if self.use_momentum and prev_momentum is not None:
+            # Preprocess momentum
+            mom_flat = prev_momentum.flatten()
+            log_m, sign_m = preprocess_gradient(mom_flat)
+
+            # Stack features: [N, 4]
+            features = torch.stack([log_g, sign_g, log_m, sign_m], dim=-1)
+        else:
+            # Stack features: [N, 2]
+            features = torch.stack([log_g, sign_g], dim=-1)
+
+        # Forward through network: [N, 4] -> [N, hidden] -> [N, 1]
+        update_flat = self.net(features).squeeze(-1)  # [N]
+
+        # Reshape to original gradient shape
+        return update_flat.view(original_shape)
+
+    def compute_stats(self, tensor: Tensor) -> Tensor:
+        """Compute statistics [mean, std, norm] for a tensor (for compatibility)."""
+        with torch.no_grad():
+            mean = tensor.mean()
+            std = tensor.std() if tensor.numel() > 1 else torch.tensor(0.0, device=tensor.device)
+            norm = tensor.norm()
+        return torch.stack([mean, std, norm])
 
 
 class ContinuumMemoryState:
@@ -163,7 +341,7 @@ class ContinuumMemoryState:
     Implements hierarchical memory with exponentially spaced update frequencies:
     - Level 0: Updates every step (fast adaptation)
     - Level 1: Every base_freq steps (short-term patterns)
-    - Level 2: Every base_freq² steps (long-term knowledge)
+    - Level 2: Every base_freq^2 steps (long-term knowledge)
 
     Args:
         param_shape: Shape of the parameter tensor
@@ -194,6 +372,10 @@ class ContinuumMemoryState:
                 'step_count': 0,
                 'ema_decay': 0.99 ** (1.0 / freq),  # Slower decay at higher levels
                 'accumulated_grad': torch.zeros(param_shape, device=self.device),
+                # Paper-aligned additions:
+                'ema_grad': torch.zeros(param_shape, device=self.device),  # L2 regression target
+                'v_sq': torch.zeros(param_shape, device=self.device),  # Second-moment (Adam-style)
+                'beta2': 0.999,  # Standard Adam beta2 for variance tracking
             }
 
     def should_update(self, level: int, global_step: int) -> bool:
@@ -223,18 +405,62 @@ class ContinuumMemoryState:
         """Get current momentum for a level."""
         return self.levels[level]['momentum']
 
+    def update_ema_grad(self, level: int, grad: Tensor):
+        """Update EMA gradient for L2 regression target (paper-aligned)."""
+        state = self.levels[level]
+        decay = state['ema_decay']
+        state['ema_grad'] = decay * state['ema_grad'] + (1 - decay) * grad
+
+    def get_ema_grad(self, level: int) -> Tensor:
+        """Get EMA gradient target for L2 regression."""
+        return self.levels[level]['ema_grad']
+
+    def update_second_moment(self, level: int, grad: Tensor):
+        """Update running variance estimate (Adam-style v_t) for adaptive LR."""
+        state = self.levels[level]
+        beta2 = state['beta2']
+        state['v_sq'] = beta2 * state['v_sq'] + (1 - beta2) * grad.pow(2)
+
+    def get_adaptive_lr(self, level: int, eps: float = 1e-8) -> Tensor:
+        """Get per-parameter adaptive learning rate from second moment.
+
+        Uses bias-corrected estimate and clamping to prevent numerical issues.
+        When v_sq is still near zero (early training), returns 1.0 (no adaptation).
+        """
+        state = self.levels[level]
+        v_sq = state['v_sq']
+        step_count = state['step_count']
+
+        # Bias correction (like Adam)
+        if step_count > 0:
+            beta2 = state['beta2']
+            bias_correction = 1 - (beta2 ** step_count)
+            v_sq_corrected = v_sq / bias_correction
+        else:
+            # No updates yet - return no adaptation
+            return torch.ones_like(v_sq)
+
+        # Compute adaptive LR with clamping to prevent extreme values
+        # Standard Adam uses 1/sqrt(v), but clamp to [0.1, 10.0] for stability
+        adaptive_lr = 1.0 / (v_sq_corrected.sqrt() + eps)
+        adaptive_lr = adaptive_lr.clamp(min=0.1, max=10.0)
+
+        return adaptive_lr
+
     def to(self, device: torch.device) -> 'ContinuumMemoryState':
         """Move all tensors to device."""
         self.device = device
         for level_state in self.levels.values():
             level_state['momentum'] = level_state['momentum'].to(device)
             level_state['accumulated_grad'] = level_state['accumulated_grad'].to(device)
+            level_state['ema_grad'] = level_state['ema_grad'].to(device)
+            level_state['v_sq'] = level_state['v_sq'].to(device)
         return self
 
 
 class DeepNestedOptimizer:
     """
-    Complete Nested Learning optimizer.
+    Complete Nested Learning optimizer for MoE models.
 
     Combines:
     - L2RegressionMomentum: Learned gradient compression (DMGD)
@@ -247,7 +473,7 @@ class DeepNestedOptimizer:
     - 'explicit': Manual meta-update calls (for PPO with GradScaler)
 
     Args:
-        model: Model to optimize
+        model: Model to optimize (MoEMinimalLLM)
         base_lr: Base learning rate
         meta_lr: Learning rate for meta-optimizer (trains MomentumMLP + Controller)
         k_unroll: Number of steps to unroll for meta-objective
@@ -283,12 +509,20 @@ class DeepNestedOptimizer:
         k_unroll: int = 5,
         cms_frequencies: Optional[List[int]] = None,
         momentum_hidden_dim: int = 64,
+        momentum_num_layers: int = 2,
         controller_hidden_dim: int = 32,
+        controller_num_layers: int = 2,
         use_gradient_checkpointing: bool = True,
         mode: str = 'simple',
         meta_update_freq: int = 100,
         weight_decay: float = 0.0,
         max_grad_norm: float = 1.0,
+        low_memory: bool = False,  # Use full CMS levels for proper forgetting prevention
+        use_cms_updates: bool = False,  # AdamW + learned LR multipliers (proven to work)
+        use_preprocessing: bool = True,  # Use Andrychowicz 2016 gradient preprocessing
+        # NOTE: use_preprocessing=True (default) enables per-element MLP with log-sign
+        # preprocessing, which should perform much better than summary-statistics approach.
+        # Set to False to use legacy L2RegressionMomentum (scalar coefficients).
     ):
         if mode not in ('simple', 'explicit'):
             raise ValueError(f"mode must be 'simple' or 'explicit', got {mode}")
@@ -297,30 +531,36 @@ class DeepNestedOptimizer:
         self.base_lr = base_lr
         self.meta_lr = meta_lr
         self.k_unroll = k_unroll
-        self.cms_frequencies = cms_frequencies or [1, 10, 100]
+        # Low memory mode uses single-level CMS (saves ~4GB for 167M param model)
+        if low_memory:
+            self.cms_frequencies = cms_frequencies or [1]  # Single level
+        else:
+            self.cms_frequencies = cms_frequencies or [1, 10, 100]  # 3 levels
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.mode = mode
         self.meta_update_freq = meta_update_freq
         self.weight_decay = weight_decay
         self.max_grad_norm = max_grad_norm
+        self.use_cms_updates = use_cms_updates
+        self.use_preprocessing = use_preprocessing
 
         # Get device from model
         self.device = next(model.parameters()).device
 
-        # Group parameters (core vs memory)
-        core_params, memory_params = group_titans_params(model)
+        # Group parameters (core vs embed) - MoE-specific grouping
+        core_params, embed_params = group_moe_params(model)
         self.n_groups = 2
 
-        # Handle empty memory group
-        if len(memory_params) == 0:
+        # Handle empty embed group (unlikely but possible)
+        if len(embed_params) == 0:
             _param_groups = [
                 {'params': core_params, 'lr': base_lr, 'name': 'core'},
-                {'params': [], 'lr': base_lr, 'name': 'memory'},
+                {'params': [], 'lr': base_lr, 'name': 'embed'},
             ]
         else:
             _param_groups = [
                 {'params': core_params, 'lr': base_lr, 'name': 'core'},
-                {'params': memory_params, 'lr': base_lr, 'name': 'memory'},
+                {'params': embed_params, 'lr': base_lr, 'name': 'embed'},
             ]
 
         # Create base optimizer (AdamW) for actual parameter updates
@@ -331,12 +571,25 @@ class DeepNestedOptimizer:
         )
 
         # Learned components
-        self.momentum_mlp = L2RegressionMomentum(
-            hidden_dim=momentum_hidden_dim,
-        ).to(self.device)
+        # Choose between new per-element MLP (Andrychowicz 2016) and legacy scalar-coefficient MLP
+        if use_preprocessing:
+            # DirectUpdateMLP: per-element features -> per-element updates
+            # Uses smaller hidden_dim (20 vs 64) since it processes elements, not stats
+            self.momentum_mlp = DirectUpdateMLP(
+                hidden_dim=min(momentum_hidden_dim, 20),  # Paper uses small hidden dim
+                num_layers=momentum_num_layers,
+                use_momentum=True,
+            ).to(self.device)
+        else:
+            # Legacy: summary stats -> scalar coefficients -> linear combination
+            self.momentum_mlp = L2RegressionMomentum(
+                hidden_dim=momentum_hidden_dim,
+                num_layers=momentum_num_layers,
+            ).to(self.device)
 
         self.controller = NestedController(
             hidden_dim=controller_hidden_dim,
+            num_layers=controller_num_layers,
             n_groups=self.n_groups,
         ).to(self.device)
 
@@ -346,6 +599,25 @@ class DeepNestedOptimizer:
             list(self.controller.parameters()),
             lr=meta_lr,
         )
+
+        # Separate optimizer for DirectUpdateMLP training via surrogate loss
+        # This runs on every CMS step for online learning
+        if use_preprocessing:
+            self.mlp_optimizer = torch.optim.Adam(
+                self.momentum_mlp.parameters(),
+                lr=1e-3,  # Higher LR for faster MLP adaptation
+            )
+            # Track previous MLP outputs for temporal smoothness loss
+            self._mlp_output_history: Dict[int, Tensor] = {}
+            # Training frequency for MLP (every N steps)
+            self.mlp_train_freq = 5  # Train every 5 steps to reduce memory pressure
+            # Accumulated surrogate losses for batch update
+            self._surrogate_losses: List[Tensor] = []
+        else:
+            self.mlp_optimizer = None
+            self._mlp_output_history = {}
+            self.mlp_train_freq = 1
+            self._surrogate_losses = []
 
         # Per-parameter state (CMS + momentum)
         self.state: Dict[Tensor, ContinuumMemoryState] = {}
@@ -391,6 +663,8 @@ class DeepNestedOptimizer:
         """Compute average depth for each parameter group."""
         if hasattr(self.model, 'config') and hasattr(self.model.config, 'n_layers'):
             n_layers = self.model.config.n_layers
+        elif hasattr(self.model, 'transformer_blocks'):
+            n_layers = len(self.model.transformer_blocks)
         elif hasattr(self.model, 'layers'):
             n_layers = len(self.model.layers)
         else:
@@ -421,37 +695,119 @@ class DeepNestedOptimizer:
 
         Returns:
             Tensor of shape [n_groups, 3] with [grad_norm, param_norm, avg_depth]
+
+        Note: All computation stays on GPU to avoid CPU sync overhead.
         """
-        stats = []
+        # Pre-allocate result tensor on GPU
+        stats = torch.zeros(self.n_groups, 3, device=self.device, dtype=torch.float32)
+
         for i, group in enumerate(self.param_groups):
             if len(group['params']) == 0:
-                stats.append([0.0, 0.0, self.group_depths[i].item()])
+                stats[i, 2] = self.group_depths[i]
                 continue
 
-            grad_norm_sq = 0.0
-            param_norm_sq = 0.0
+            # Collect all grad and param norms on GPU
+            grad_norms_sq = []
+            param_norms_sq = []
 
             for param in group['params']:
+                # Use in-place norm computation, stays on GPU
+                param_norms_sq.append(param.pow(2).sum())
                 if param.grad is not None:
-                    grad_norm_sq += param.grad.norm().item() ** 2
-                param_norm_sq += param.norm().item() ** 2
+                    grad_norms_sq.append(param.grad.pow(2).sum())
 
-            stats.append([
-                grad_norm_sq ** 0.5,
-                param_norm_sq ** 0.5,
-                self.group_depths[i].item(),
-            ])
+            # Sum on GPU, then sqrt
+            if grad_norms_sq:
+                stats[i, 0] = torch.stack(grad_norms_sq).sum().sqrt()
+            if param_norms_sq:
+                stats[i, 1] = torch.stack(param_norms_sq).sum().sqrt()
+            stats[i, 2] = self.group_depths[i]
 
-        return torch.tensor(stats, dtype=torch.float32, device=self.device)
+        return stats
 
     def _get_context(self, loss_value: float) -> Tensor:
-        """Create context vector for MomentumMLP."""
-        norm_loss = torch.log(torch.tensor(max(loss_value, 1e-8) + 1.0))
-        return torch.tensor(
-            [self.global_step / 1000.0, self.base_lr, norm_loss.item()],
-            device=self.device,
-            dtype=torch.float32,
-        )
+        """Create context vector for MomentumMLP.
+
+        Uses cached tensor to avoid CPU->GPU transfer overhead.
+        """
+        # Lazy init cached context tensor
+        if not hasattr(self, '_context_cache'):
+            self._context_cache = torch.zeros(3, device=self.device, dtype=torch.float32)
+
+        # Update in-place on GPU (no CPU->GPU transfer)
+        self._context_cache[0] = self.global_step / 1000.0
+        self._context_cache[1] = self.base_lr
+        self._context_cache[2] = math.log(max(loss_value, 1e-8) + 1.0)
+
+        return self._context_cache
+
+    def _compute_surrogate_loss(
+        self,
+        mlp_output: Tensor,
+        grad: Tensor,
+        prev_output: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Compute surrogate loss for training DirectUpdateMLP during CMS mode.
+
+        This is the key training signal for the MLP - it learns to output updates
+        that align with gradient direction while preserving appropriate magnitude.
+
+        Based on erikl2/nested-learning deep_momentum.py approach:
+        1. Cosine similarity loss: output should point in same direction as gradient
+        2. Magnitude preservation: output magnitude should match gradient magnitude
+        3. Temporal smoothness (optional): output shouldn't change too fast
+
+        Args:
+            mlp_output: Output from DirectUpdateMLP (same shape as grad)
+            grad: Current gradient (target direction)
+            prev_output: Previous MLP output for temporal smoothness (optional)
+
+        Returns:
+            Scalar loss tensor for backpropagation
+        """
+        # Component 1: Reconstruction/Direction loss (cosine similarity)
+        # MLP output should point in the same direction as the gradient
+        mlp_flat = mlp_output.flatten()
+        grad_flat = grad.flatten()
+
+        grad_norm = grad_flat.norm()
+        output_norm = mlp_flat.norm()
+
+        if grad_norm > 1e-8 and output_norm > 1e-8:
+            cosine_sim = F.cosine_similarity(
+                mlp_flat.unsqueeze(0),
+                grad_flat.unsqueeze(0),
+            )
+            reconstruction_loss = 1.0 - cosine_sim.mean()
+        else:
+            reconstruction_loss = torch.tensor(0.0, device=grad.device, requires_grad=True)
+
+        # Component 2: Magnitude preservation
+        # Output magnitude should be similar to gradient magnitude
+        # This ensures MLP doesn't learn to output tiny or huge updates
+        if grad_norm > 1e-8:
+            magnitude_ratio = output_norm / grad_norm
+            # Penalize deviation from ratio of 1.0
+            magnitude_loss = (magnitude_ratio - 1.0).pow(2)
+        else:
+            # If gradient is near-zero, penalize large outputs
+            magnitude_loss = output_norm.pow(2)
+
+        # Component 3: Temporal smoothness (optional)
+        # Prevents MLP from oscillating wildly between steps
+        temporal_loss = torch.tensor(0.0, device=grad.device, requires_grad=True)
+        if prev_output is not None:
+            prev_flat = prev_output.flatten()
+            if prev_flat.shape == mlp_flat.shape:
+                # Penalize large changes in output
+                temporal_loss = (mlp_flat - prev_flat).pow(2).mean() * 0.1
+
+        # Combine losses with appropriate weighting
+        # Reconstruction is primary, magnitude is secondary, temporal is tertiary
+        total_loss = reconstruction_loss + 0.1 * magnitude_loss + temporal_loss
+
+        return total_loss
 
     def set_loss(self, loss_value: float):
         """
@@ -466,10 +822,15 @@ class DeepNestedOptimizer:
 
     def step(self, loss_value: Optional[float] = None):
         """
-        Perform optimization step.
+        Perform optimization step with Continuum Memory System (CMS).
 
-        In 'simple' mode, may trigger automatic meta-update.
-        In 'explicit' mode, only does inner optimization step.
+        Implements multi-frequency updates per the Nested Learning paper:
+        - Level 0: Updates every step (fast adaptation)
+        - Level 1: Updates every 10 steps (short-term patterns)
+        - Level 2: Updates every 100 steps (long-term consolidation)
+
+        Each level accumulates gradients and applies learned momentum transformation.
+        Slower levels preserve consolidated knowledge (anti-forgetting mechanism).
 
         Args:
             loss_value: Current loss (required for controller updates)
@@ -498,45 +859,244 @@ class DeepNestedOptimizer:
         else:
             self.ema_loss = (1 - self.beta_ema) * self.ema_loss + self.beta_ema * actual_loss
 
-        # Compute gradient statistics
+        # Compute gradient statistics for controller
         stats = self._compute_group_stats()
 
         # Get LR multipliers from controller
         with torch.no_grad():
             self._lr_multipliers = self.controller(stats)
 
-        # Update base optimizer learning rates
-        for i, group in enumerate(self.base_optimizer.param_groups):
-            if len(group['params']) > 0:
-                group['lr'] = self.base_lr * self._lr_multipliers[i].item()
-
         # Clip gradients
         if self.max_grad_norm > 0:
             clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-        # Base optimizer step
-        self.base_optimizer.step()
+        if not self.use_cms_updates:
+            # === ADAMW MODE (proven to work) ===
+            # Update base optimizer learning rates with controller's multipliers
+            # Pre-compute effective LRs (one GPU->CPU transfer instead of per-group .item())
+            effective_lrs = (self.base_lr * self._lr_multipliers).tolist()
+            for i, group in enumerate(self.base_optimizer.param_groups):
+                if len(group['params']) > 0:
+                    group['lr'] = effective_lrs[i]
+
+            # Let AdamW handle the actual update (has adaptive per-param LR)
+            self.base_optimizer.step()
+        else:
+            # === CMS MODE (experimental) ===
+            # Get context for momentum MLP
+            context = self._get_context(actual_loss)
+
+            # CMS-based parameter updates (replaces base_optimizer.step())
+            # Pre-compute effective LRs (one GPU op instead of per-group .item())
+            effective_lrs = (self.base_lr * self._lr_multipliers).tolist()
+
+            # === PHASE 1: Train DirectUpdateMLP via surrogate loss ===
+            # This must happen WITH gradients before we apply updates
+            should_train_mlp = (
+                self.use_preprocessing and
+                self.mlp_optimizer is not None and
+                self.global_step % self.mlp_train_freq == 0
+            )
+
+            if should_train_mlp:
+                # Sample a subset of parameters for MLP training (for efficiency)
+                # We sample ~10% or max 20 parameters
+                training_samples = []
+                sample_count = 0
+                max_samples = 20
+
+                for group_idx, group in enumerate(self.base_optimizer.param_groups):
+                    for param in group['params']:
+                        if param.grad is None:
+                            continue
+                        # Sample every 10th parameter, or all if small model
+                        if sample_count < max_samples:
+                            cms = self.state[param]
+                            # Only train on level 0 (fast level) for efficiency
+                            if cms.should_update(0, self.global_step):
+                                training_samples.append((param, cms))
+                                sample_count += 1
+                        else:
+                            break
+                    if sample_count >= max_samples:
+                        break
+
+                # Compute surrogate losses for sampled parameters
+                if training_samples:
+                    surrogate_losses = []
+
+                    for param, cms in training_samples:
+                        grad = param.grad.detach()  # Detach from main model graph
+                        # IMPORTANT: Detach accumulated grad to prevent gradient graph leak
+                        level_grad = cms.levels[0]['accumulated_grad'].detach().clone()
+                        freq = self.cms_frequencies[0] if len(self.cms_frequencies) > 0 else 1
+                        level_grad = level_grad / max(freq, 1)
+                        prev_momentum = cms.get_momentum(0).detach()
+
+                        # Forward through MLP WITH gradients
+                        mlp_output = self.momentum_mlp(level_grad, prev_momentum)
+
+                        # Get previous output for temporal smoothness
+                        param_id = id(param)
+                        prev_output = self._mlp_output_history.get(param_id, None)
+
+                        # Compute surrogate loss
+                        loss = self._compute_surrogate_loss(mlp_output, level_grad, prev_output)
+                        surrogate_losses.append(loss)
+
+                        # Store output for next step's temporal smoothness
+                        self._mlp_output_history[param_id] = mlp_output.detach().clone()
+
+                    # Update MLP weights
+                    if surrogate_losses:
+                        total_surrogate_loss = torch.stack(surrogate_losses).mean()
+
+                        self.mlp_optimizer.zero_grad()
+                        total_surrogate_loss.backward()
+
+                        # Clip MLP gradients for stability
+                        clip_grad_norm_(self.momentum_mlp.parameters(), max_norm=1.0)
+
+                        self.mlp_optimizer.step()
+
+                        # Store as tensor for lazy eval - only convert to .item() when logging
+                        self._last_surrogate_loss = total_surrogate_loss.detach()
+
+            # === PHASE 2: Apply parameter updates (no gradients needed) ===
+            with torch.no_grad():
+                for group_idx, group in enumerate(self.base_optimizer.param_groups):
+                    lr = effective_lrs[group_idx]
+
+                    for param in group['params']:
+                        if param.grad is None:
+                            continue
+
+                        grad = param.grad
+                        cms = self.state[param]
+
+                        # Accumulate gradient into all CMS levels
+                        cms.accumulate_grad(grad)
+
+                        # Compute update from each active level
+                        total_update = torch.zeros_like(param)
+                        num_active_levels = 0
+
+                        for level in range(len(self.cms_frequencies)):
+                            if cms.should_update(level, self.global_step):
+                                # Get accumulated gradient for this level
+                                level_grad = cms.get_update(level)
+                                prev_momentum = cms.get_momentum(level)
+
+                                # CRITICAL: Normalize by accumulation steps to get average gradient
+                                freq = self.cms_frequencies[level] if level < len(self.cms_frequencies) else 1
+                                level_grad = level_grad / max(freq, 1)
+
+                                # Paper-aligned: Update EMA gradient target for L2 regression
+                                cms.update_ema_grad(level, level_grad)
+
+                                # Paper-aligned: Update second-moment for adaptive per-param LR
+                                cms.update_second_moment(level, level_grad)
+
+                                # Apply learned momentum transformation
+                                # Branch based on MLP type (preprocessing vs legacy)
+                                if self.use_preprocessing:
+                                    # DirectUpdateMLP: outputs per-element update directly
+                                    # The MLP takes gradient and momentum, outputs update
+                                    level_update = self.momentum_mlp(level_grad, prev_momentum)
+
+                                    # Update momentum with exponential decay + new update
+                                    # This is similar to Adam's approach: track running average
+                                    beta1 = 0.9  # Momentum coefficient
+                                    new_momentum = beta1 * prev_momentum + (1 - beta1) * level_update
+
+                                    # Soft clamp momentum at 100x gradient magnitude
+                                    grad_norm = level_grad.norm().clamp(min=1e-8)
+                                    momentum_norm = new_momentum.norm()
+                                    if momentum_norm > 100.0 * grad_norm:
+                                        new_momentum = new_momentum * (100.0 * grad_norm / momentum_norm)
+
+                                    cms.update_momentum(level, new_momentum)
+
+                                    # Use the MLP output directly as the level update
+                                    # No damping factor needed - MLP learns to output proper magnitude
+                                    level_weight = 1.0
+                                else:
+                                    # Legacy L2RegressionMomentum: outputs scalar coefficients
+                                    scale, shift, damping = self.momentum_mlp(
+                                        level_grad, prev_momentum, context
+                                    )
+
+                                    # Update momentum: v = scale * v_prev + shift * grad
+                                    # MLP outputs scale in [0.5, 0.99] via sigmoid*0.49+0.5
+                                    # Scale < 1.0 ensures momentum converges (no exponential growth)
+                                    new_momentum = scale * prev_momentum + shift * level_grad
+
+                                    # Soft clamp at 100x gradient magnitude (safety net, not primary control)
+                                    grad_norm = level_grad.norm().clamp(min=1e-8)
+                                    momentum_norm = new_momentum.norm()
+                                    if momentum_norm > 100.0 * grad_norm:
+                                        new_momentum = new_momentum * (100.0 * grad_norm / momentum_norm)
+
+                                    cms.update_momentum(level, new_momentum)
+
+                                    # Equal weighting for all levels
+                                    level_weight = 1.0
+
+                                    # Compute level contribution with damping
+                                    level_update = new_momentum * (1 - damping) * level_weight
+
+                                # NaN check
+                                if torch.isnan(level_update).any() or torch.isinf(level_update).any():
+                                    continue  # Skip this level's contribution
+
+                                total_update += level_update
+                                num_active_levels += 1
+
+                        # Apply combined update if any levels were active
+                        if num_active_levels > 0:
+                            # Use sqrt(n) normalization to prevent magnitude explosion
+                            # when multiple levels fire simultaneously
+                            if num_active_levels > 1:
+                                geom_factor = num_active_levels ** 0.5  # sqrt(n)
+                                total_update = total_update / geom_factor
+
+                            # Final NaN/Inf check
+                            if torch.isnan(total_update).any() or torch.isinf(total_update).any():
+                                continue  # Skip this parameter entirely
+
+                            # Weight decay
+                            if self.weight_decay > 0:
+                                total_update += self.weight_decay * param
+
+                            # Apply update with learning rate
+                            param.add_(total_update, alpha=-lr)
 
         # Simple mode: auto meta-update
         if self.mode == 'simple' and self.global_step % self.meta_update_freq == 0:
-            # Note: In simple mode, we use training loss as proxy for meta-loss
-            # This is less principled but simpler
             self._update_meta_components(actual_loss)
 
-        return {
+        # Build return dict with surrogate loss info if available
+        result = {
             'global_step': self.global_step,
             'lr_multipliers': self._lr_multipliers.clone(),
             'ema_loss': self.ema_loss.clone(),
         }
 
+        # Add surrogate loss if we trained the MLP this step
+        if hasattr(self, '_last_surrogate_loss'):
+            result['surrogate_loss'] = self._last_surrogate_loss
+
+        return result
+
     def _update_meta_components(self, loss_value: float):
         """
         Update MomentumMLP and Controller via simplified meta-learning.
 
-        Uses SimplifiedMetaTrainer which tracks loss history and computes
-        a proxy meta-objective based on correlation with improvement.
+        Both components are now included in the computation graph:
+        - Controller: trained via proxy loss on LR multipliers
+        - MomentumMLP: trained via proxy loss on scale/shift/damping outputs
 
-        For proper meta-learning with validation data, use meta_update().
+        The proxy objective rewards outputs that correlate with loss improvement.
         """
         # Record step in simplified trainer
         momentum_stats = self.get_momentum_stats()
@@ -549,25 +1109,129 @@ class DeepNestedOptimizer:
         # Compute gradient statistics
         stats = self._compute_group_stats()
 
-        # Forward through controller
         self.meta_optimizer.zero_grad()
-        multipliers = self.controller(stats)
 
-        # Use simplified meta-trainer's proxy loss
-        meta_loss = self.simplified_meta_trainer.compute_proxy_loss(
+        # === Controller Loss ===
+        multipliers = self.controller(stats)
+        controller_loss = self.simplified_meta_trainer.compute_proxy_loss(
             current_multipliers=multipliers,
             current_loss=loss_value,
         )
 
+        # === MomentumMLP Loss ===
+        # Sample a few parameters to get representative MLP outputs
+        # This puts the MLP in the computation graph so it gets gradients
+        mlp_loss = self._compute_mlp_proxy_loss(loss_value)
+
+        # Combined meta-loss
+        meta_loss = controller_loss + mlp_loss
+
         meta_loss.backward()
 
-        self.controller_grad_norm = clip_grad_norm_(
+        # Keep as tensor - only convert to .item() when logging to avoid GPU sync
+        self._controller_grad_norm_tensor = clip_grad_norm_(
             list(self.momentum_mlp.parameters()) + list(self.controller.parameters()),
             max_norm=1.0,
-        ).item()
+        )
+        self.controller_grad_norm = self._controller_grad_norm_tensor  # Lazy eval
 
         self.meta_optimizer.step()
-        self.last_meta_loss = meta_loss.item()
+        self._last_meta_loss_tensor = meta_loss.detach()
+        self.last_meta_loss = self._last_meta_loss_tensor  # Lazy eval
+
+    def _compute_mlp_proxy_loss(self, loss_value: float) -> Tensor:
+        """
+        Compute L2 regression loss for MomentumMLP training (paper-aligned).
+
+        Per the Nested Learning paper:
+        - target = EMA of gradients (what standard momentum would compute)
+        - predicted = MLP-transformed update
+        - loss = ||predicted_stats - target_stats||^2
+
+        For DirectUpdateMLP (use_preprocessing=True):
+        - Compares MLP output directly to EMA target
+
+        For L2RegressionMomentum (use_preprocessing=False):
+        - Compares scalar-combined momentum to EMA target
+        """
+        # Check if we have enough history
+        if len(self.simplified_meta_trainer.loss_history) < 10:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Get context for legacy MLP (not needed for DirectUpdateMLP)
+        context = self._get_context(loss_value)
+
+        # Sample a subset of parameters for efficiency (max 10)
+        sampled_params = []
+        for group in self.param_groups:
+            for param in group['params'][:5]:  # First 5 from each group
+                if param.grad is not None:
+                    sampled_params.append(param)
+        sampled_params = sampled_params[:10]
+
+        if not sampled_params:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        count = 0
+
+        for param in sampled_params:
+            cms = self.state[param]
+            grad = param.grad
+
+            # Level 0 (fast) is always active and has the freshest EMA
+            prev_momentum = cms.get_momentum(0)
+            ema_target = cms.get_ema_grad(0)
+
+            # Skip if EMA hasn't been initialized yet
+            if ema_target.abs().max() < 1e-10:
+                continue
+
+            if self.use_preprocessing:
+                # DirectUpdateMLP: outputs per-element update directly
+                # Forward through MLP WITH gradients
+                predicted_update = self.momentum_mlp(grad, prev_momentum)
+
+                # L2 regression: ||predicted - target||^2
+                # For efficiency, compare statistics (mean, std, norm)
+                pred_stats = self.momentum_mlp.compute_stats(predicted_update.flatten())
+                target_stats = self.momentum_mlp.compute_stats(ema_target.flatten())
+
+                # L2 loss on statistics (3-dim vector: mean, std, norm)
+                param_loss = (pred_stats - target_stats).pow(2).sum()
+            else:
+                # Legacy L2RegressionMomentum: outputs scalar coefficients
+                scale, shift, damping = self.momentum_mlp(grad, prev_momentum, context)
+
+                # Predicted momentum from MLP (what CMS would produce)
+                predicted_momentum = scale * prev_momentum + shift * grad
+
+                # Paper-aligned L2 regression: ||predicted - target||^2
+                # Compare statistics for efficiency (mean, std, norm)
+                pred_stats = self.momentum_mlp.compute_stats(predicted_momentum.flatten())
+                target_stats = self.momentum_mlp.compute_stats(ema_target.flatten())
+
+                # L2 loss on statistics (3-dim vector: mean, std, norm)
+                param_loss = (pred_stats - target_stats).pow(2).sum()
+
+            total_loss = total_loss + param_loss
+            count += 1
+
+        if count > 0:
+            total_loss = total_loss / count
+
+        # Add regularization toward good defaults when loss is stagnating
+        recent_improvement = (
+            self.simplified_meta_trainer.loss_history[0] -
+            self.simplified_meta_trainer.loss_history[-1]
+        )
+
+        if recent_improvement < 0.001:
+            # Loss is stagnating - add exploration bonus
+            # Small penalty to push away from stuck configurations
+            total_loss = total_loss + 0.01
+
+        return total_loss
 
     def meta_update(
         self,
@@ -621,20 +1285,54 @@ class DeepNestedOptimizer:
 
             meta_loss.backward()
 
-            self.controller_grad_norm = clip_grad_norm_(
+            # Keep as tensor - only convert to .item() when logging to avoid GPU sync
+            self._controller_grad_norm_tensor = clip_grad_norm_(
                 list(self.momentum_mlp.parameters()) + list(self.controller.parameters()),
                 max_norm=1.0,
-            ).item()
+            )
+            self.controller_grad_norm = self._controller_grad_norm_tensor  # Lazy eval
 
             self.meta_optimizer.step()
-            self.last_meta_loss = meta_loss.item()
+            self._last_meta_loss_tensor = meta_loss.detach()
+            self.last_meta_loss = self._last_meta_loss_tensor  # Lazy eval
 
         else:
             # Simplified: just use validation loss as proxy
-            with torch.no_grad():
-                val_loss = loss_fn(self.model, val_batch)
+            # NOTE: We don't use torch.no_grad() here because some models
+            # (like TitanMAC with neural memory) use torch.autograd.grad()
+            # internally and need gradient tracking enabled.
+            # We just compute the loss value without backpropagating.
 
-            self._update_meta_components(val_loss.item())
+            # Clear cache before forward pass to reduce OOM risk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Use smaller batch if provided batch is large (reduce memory)
+            if isinstance(val_batch, dict) and 'input_ids' in val_batch:
+                batch_size = val_batch['input_ids'].size(0)
+                if batch_size > 4:
+                    # Use only first 4 samples to reduce memory
+                    val_batch = {
+                        k: v[:4] if torch.is_tensor(v) else v
+                        for k, v in val_batch.items()
+                    }
+
+            val_loss = loss_fn(self.model, val_batch)
+
+            # Detach to avoid any gradient accumulation from this forward pass
+            if hasattr(val_loss, 'detach'):
+                val_loss_value = val_loss.detach().item()
+            else:
+                val_loss_value = float(val_loss)
+
+            # Clear any gradients that accumulated during the forward pass
+            self.base_optimizer.zero_grad(set_to_none=True)
+
+            # Clear cache after forward pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            self._update_meta_components(val_loss_value)
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero gradients for base optimizer."""
@@ -646,20 +1344,28 @@ class DeepNestedOptimizer:
 
     def get_effective_lrs(self) -> List[float]:
         """Get effective learning rates per group."""
-        return [
-            self.base_lr * mult.item()
-            for mult in self._lr_multipliers
-        ]
+        return (self.base_lr * self._lr_multipliers).tolist()
 
     def get_momentum_stats(self) -> Dict[str, float]:
-        """Get statistics about momentum states for logging."""
-        total_norm = 0.0
-        count = 0
+        """Get statistics about momentum states for logging.
+
+        Uses batched GPU computation to avoid per-tensor .item() calls.
+        """
+        # Collect all momentum norms on GPU
+        momentum_norms = []
         for param, state in self.state.items():
             for level in range(state.num_levels):
                 m = state.get_momentum(level)
-                total_norm += m.norm().item()
-                count += 1
+                momentum_norms.append(m.pow(2).sum())
+
+        if momentum_norms:
+            # Single sqrt and sum on GPU, one .item() at the end
+            stacked = torch.stack(momentum_norms)
+            total_norm = stacked.sqrt().sum().item()
+            count = len(momentum_norms)
+        else:
+            total_norm = 0.0
+            count = 1
 
         return {
             'momentum_total_norm': total_norm,
@@ -669,7 +1375,7 @@ class DeepNestedOptimizer:
 
     def state_dict(self) -> Dict[str, Any]:
         """Get optimizer state for checkpointing."""
-        # Serialize CMS state
+        # Serialize CMS state (including paper-aligned additions)
         cms_state = {}
         for i, (param, state) in enumerate(self.state.items()):
             cms_state[i] = {
@@ -677,11 +1383,14 @@ class DeepNestedOptimizer:
                     'momentum': state.levels[level]['momentum'].clone(),
                     'step_count': state.levels[level]['step_count'],
                     'accumulated_grad': state.levels[level]['accumulated_grad'].clone(),
+                    # Paper-aligned additions
+                    'ema_grad': state.levels[level]['ema_grad'].clone(),
+                    'v_sq': state.levels[level]['v_sq'].clone(),
                 }
                 for level in state.levels
             }
 
-        return {
+        state = {
             'base_optimizer': self.base_optimizer.state_dict(),
             'momentum_mlp': self.momentum_mlp.state_dict(),
             'controller': self.controller.state_dict(),
@@ -691,6 +1400,12 @@ class DeepNestedOptimizer:
             'ema_loss': self.ema_loss.clone(),
             'cms_state': cms_state,
         }
+
+        # Save MLP optimizer state if it exists (CMS mode with preprocessing)
+        if self.mlp_optimizer is not None:
+            state['mlp_optimizer'] = self.mlp_optimizer.state_dict()
+
+        return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load optimizer state from checkpoint."""
@@ -702,7 +1417,7 @@ class DeepNestedOptimizer:
         self._lr_multipliers = state_dict.get('lr_multipliers', torch.ones(self.n_groups))
         self.ema_loss = state_dict.get('ema_loss', torch.zeros(self.n_groups))
 
-        # Restore CMS state
+        # Restore CMS state (including paper-aligned additions)
         if 'cms_state' in state_dict:
             cms_state = state_dict['cms_state']
             for i, (param, state) in enumerate(self.state.items()):
@@ -711,6 +1426,19 @@ class DeepNestedOptimizer:
                         state.levels[level]['momentum'] = level_data['momentum'].to(self.device)
                         state.levels[level]['step_count'] = level_data['step_count']
                         state.levels[level]['accumulated_grad'] = level_data['accumulated_grad'].to(self.device)
+                        # Paper-aligned additions (with backwards compatibility)
+                        state.levels[level]['ema_grad'] = level_data.get(
+                            'ema_grad',
+                            torch.zeros_like(state.levels[level]['momentum'])
+                        ).to(self.device)
+                        state.levels[level]['v_sq'] = level_data.get(
+                            'v_sq',
+                            torch.zeros_like(state.levels[level]['momentum'])
+                        ).to(self.device)
+
+        # Restore MLP optimizer state if it exists
+        if 'mlp_optimizer' in state_dict and self.mlp_optimizer is not None:
+            self.mlp_optimizer.load_state_dict(state_dict['mlp_optimizer'])
 
     @property
     def param_groups(self) -> List[Dict]:

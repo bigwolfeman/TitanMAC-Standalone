@@ -2,9 +2,9 @@
 NestedController: Small MLP for learning rate modulation.
 
 Maps per-group gradient statistics to LR scaling factors for
-multi-timescale learning in ContinuumOptimizer.
+multi-timescale learning in the DeepNestedOptimizer.
 
-Task: T047
+Ported from TitanMAC for MoE model training.
 """
 
 import torch
@@ -40,6 +40,7 @@ class NestedController(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 32,
+        num_layers: int = 2,
         min_lr_mult: float = 0.1,
         max_lr_mult: float = 2.0,
         n_groups: int = 2,
@@ -47,6 +48,7 @@ class NestedController(nn.Module):
         super().__init__()
 
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         self.min_lr_mult = min_lr_mult
         self.max_lr_mult = max_lr_mult
         self.n_groups = n_groups
@@ -55,14 +57,12 @@ class NestedController(nn.Module):
         # Output: [n_groups] multipliers
         input_dim = 3  # grad_norm, param_norm, avg_depth
 
-        # Simple MLP: input -> hidden -> output
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),  # Output 1 value per group
-        )
+        # Build MLP with configurable depth
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_layers - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        layers.append(nn.Linear(hidden_dim, 1))  # Output 1 value per group
+        self.net = nn.Sequential(*layers)
 
         # Initialize weights
         self._init_weights()
