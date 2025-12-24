@@ -21,6 +21,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -269,6 +270,9 @@ class NeuralMemory(nn.Module):
         self.forget_gate = ForgetGate(d_model, forget_hidden)
         self.decay_gate = DecayGate(d_model, decay_hidden)
 
+        # Track last update stats for logging (saturation monitoring)
+        self._last_update_stats: Optional[Dict[str, float]] = None
+
         # Initialize projections
         self._init_weights()
 
@@ -330,13 +334,19 @@ class NeuralMemory(nn.Module):
 
         return loss
 
+    @torch._dynamo.disable
     def update(
         self,
         x: torch.Tensor,
         theta_t: Optional[float] = None,
+        return_stats: bool = False,
     ) -> torch.Tensor:
         """
         Update memory MLP weights with gradient-based surprise.
+
+        Note: Decorated with @torch._dynamo.disable because torch.autograd.grad()
+        is explicitly marked as non-traceable by dynamo. This allows fullgraph=True
+        compilation on the rest of the model.
 
         PAPER-FAITHFUL: Updates MLP weights, not embedding slots.
 
@@ -349,9 +359,12 @@ class NeuralMemory(nn.Module):
         Args:
             x: Input tensor [batch, seq_len, d_model]
             theta_t: Optional override for memory learning rate
+            return_stats: If True, return dict with loss and gate values
 
         Returns:
-            loss: The associative memory loss used for update
+            loss: The associative memory loss (if return_stats=False)
+            dict: {"loss": loss, "alpha_t": forget_rate, "eta_t": decay_rate,
+                   "grad_norm": grad_norm, "grad_clipped": was_clipped} (if return_stats=True)
         """
         if x.dim() != 3:
             raise ValueError(f"Expected 3D input [batch, seq, d_model], got shape {x.shape}")
@@ -378,11 +391,21 @@ class NeuralMemory(nn.Module):
         # Clip gradients for stability (in-place)
         grad_norm = self._flat_grad_cache.norm()
         max_grad_norm = 1.0
-        if grad_norm > max_grad_norm:
+        grad_clipped = grad_norm > max_grad_norm
+        if grad_clipped:
             self._flat_grad_cache.mul_(max_grad_norm / grad_norm)
 
         # Check for NaN/Inf
         if torch.isnan(self._flat_grad_cache).any() or torch.isinf(self._flat_grad_cache).any():
+            if return_stats:
+                return {
+                    "loss": loss,
+                    "alpha_t": 0.0,
+                    "eta_t": 0.0,
+                    "grad_norm": float('nan'),
+                    "grad_clipped": False,
+                    "skipped": True,
+                }
             return loss  # Skip update if gradients are invalid
 
         # Compute data-dependent gates (aggregate over sequence)
@@ -410,6 +433,26 @@ class NeuralMemory(nn.Module):
             # Set updated params back to MLP
             self._set_params_from_cache()
 
+        # Store stats as tensors for lazy eval (no .item() sync during training!)
+        # Only convert to Python floats when actually logged via get_memory_stats()
+        self._last_update_stats_tensors = {
+            "alpha_t": alpha_t.detach(),
+            "eta_t": eta_t.detach(),
+            "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm),
+            "grad_clipped": grad_clipped,
+            "skipped": False,
+        }
+
+        if return_stats:
+            # Only sync when explicitly requested
+            return {
+                "loss": loss,
+                "alpha_t": alpha_t.item(),
+                "eta_t": eta_t.item(),
+                "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                "grad_clipped": grad_clipped,
+                "skipped": False,
+            }
         return loss
 
     def retrieve(self, x: torch.Tensor) -> torch.Tensor:
@@ -444,7 +487,24 @@ class NeuralMemory(nn.Module):
             self.momentum_S.zero_()
 
     def get_memory_stats(self) -> Dict[str, float]:
-        """Get statistics about memory state for logging."""
+        """
+        Get statistics about memory state for logging.
+
+        Returns dict with:
+            - memory_param_norm: L2 norm of MLP weights
+            - momentum_norm: L2 norm of momentum buffer
+            - memory_param_mean: Mean of MLP weights
+            - memory_param_std: Std of MLP weights
+            - n_memory_layers: Number of memory MLP layers
+            - d_memory: Memory dimension
+            - n_params: Number of memory parameters
+
+        If update() was called, also includes saturation metrics:
+            - alpha_t: Forget gate output (0=retain, 1=forget)
+            - eta_t: Decay gate output (momentum decay)
+            - grad_norm: Gradient norm before clipping
+            - grad_clipped: Whether gradient was clipped
+        """
         with torch.no_grad():
             flat_params = self.memory_mlp.get_flat_params()
             param_norm = flat_params.norm().item()
@@ -452,7 +512,7 @@ class NeuralMemory(nn.Module):
             param_mean = flat_params.mean().item()
             param_std = flat_params.std().item()
 
-        return {
+        stats = {
             "memory_param_norm": param_norm,
             "momentum_norm": momentum_norm,
             "memory_param_mean": param_mean,
@@ -461,6 +521,18 @@ class NeuralMemory(nn.Module):
             "d_memory": float(self.d_memory),
             "n_params": float(len(flat_params)),
         }
+
+        # Include last update stats if available (saturation monitoring)
+        # Convert tensor stats to Python floats only when logging
+        if hasattr(self, '_last_update_stats_tensors') and self._last_update_stats_tensors is not None:
+            tensor_stats = self._last_update_stats_tensors
+            stats["alpha_t"] = tensor_stats["alpha_t"].item() if isinstance(tensor_stats["alpha_t"], torch.Tensor) else tensor_stats["alpha_t"]
+            stats["eta_t"] = tensor_stats["eta_t"].item() if isinstance(tensor_stats["eta_t"], torch.Tensor) else tensor_stats["eta_t"]
+            stats["grad_norm"] = tensor_stats["grad_norm"].item() if isinstance(tensor_stats["grad_norm"], torch.Tensor) else tensor_stats["grad_norm"]
+            stats["grad_clipped"] = tensor_stats["grad_clipped"]
+            stats["skipped"] = tensor_stats["skipped"]
+
+        return stats
 
     def extra_repr(self) -> str:
         """Extra representation for printing."""

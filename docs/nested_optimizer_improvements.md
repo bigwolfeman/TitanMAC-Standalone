@@ -1,7 +1,13 @@
 # Nested Optimizer Improvement Ideas
 
 **Date**: December 19, 2025
+**Updated**: December 20, 2025
 **Status**: Ideas for future implementation
+
+> **See Also**:
+> - `GPU_PROFILING_REPORT.md` - Performance analysis findings
+> - `PERFORMANCE_OPTIMIZATIONS.md` - Implemented optimizations (64% CUDA reduction)
+> - `OPTIMIZER_QUICK_REFERENCE.md` - Parameter reference and usage examples
 
 ## Current Training Signals
 

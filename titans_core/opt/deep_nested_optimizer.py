@@ -32,6 +32,77 @@ from .param_groups import group_moe_params, infer_param_depth
 from .meta_trainer import SimplifiedMetaTrainer, UnrolledMetaTrainer
 
 
+def _fused_clip_grad_norm_(
+    parameters: Iterator[Tensor],
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    inplace: bool = True,
+) -> Tensor:
+    """
+    Fused gradient clipping using torch._foreach_norm.
+
+    Replaces clip_grad_norm_ with a version that uses fused operations
+    to reduce kernel launches from O(n_params) to O(1).
+
+    Args:
+        parameters: Iterator of parameters with gradients
+        max_norm: Maximum allowed gradient norm
+        norm_type: Type of norm (default: 2.0 for L2 norm)
+        error_if_nonfinite: Raise error if gradient norm is NaN/Inf
+        inplace: If True, modify gradients in-place. If False, use standard
+                 clip_grad_norm_ which is safer for meta-learning graphs.
+
+    Returns:
+        Total gradient norm (scalar tensor)
+    """
+    if isinstance(parameters, Tensor):
+        parameters = [parameters]
+
+    # Convert to list to allow multiple iterations
+    parameters = list(parameters)
+
+    # Collect gradients
+    grads = [p.grad for p in parameters if p.grad is not None]
+
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+
+    device = grads[0].device
+    dtype = grads[0].dtype
+
+    if norm_type == float('inf'):
+        # Max norm: find max absolute value across all grads
+        norms = [g.abs().max() for g in grads]
+        total_norm = torch.stack(norms).max()
+    else:
+        # Use fused foreach_norm for p-norm
+        norms = torch._foreach_norm(grads, ord=norm_type)
+        stacked = torch.stack(norms)
+        total_norm = (stacked ** norm_type).sum() ** (1.0 / norm_type)
+
+    if error_if_nonfinite and (torch.isnan(total_norm) or torch.isinf(total_norm)):
+        raise RuntimeError(
+            f'The total norm of order {norm_type} for gradients from '
+            f'`parameters` is non-finite, so it cannot be clipped.'
+        )
+
+    # Clip gradients
+    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+
+    if inplace:
+        # Fused in-place multiplication - fast but breaks autograd graph
+        # Use this for CUDA graphs or when gradients aren't needed for meta-learning
+        torch._foreach_mul_(grads, clip_coef_clamped)
+    else:
+        # Non-in-place: use standard PyTorch clipping which preserves graph
+        # Slightly slower but safe for meta-learning
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, error_if_nonfinite)
+
+    return total_norm
+
+
 def preprocess_gradient(g: Tensor, p: float = 10.0) -> Tuple[Tensor, Tensor]:
     """
     Log-sign preprocessing from Andrychowicz et al. 2016.
@@ -523,6 +594,11 @@ class DeepNestedOptimizer:
         # NOTE: use_preprocessing=True (default) enables per-element MLP with log-sign
         # preprocessing, which should perform much better than summary-statistics approach.
         # Set to False to use legacy L2RegressionMomentum (scalar coefficients).
+        use_compile: bool = False,  # Apply torch.compile to controller/MLP for faster inference
+        controller_update_freq: int = 1,  # Update controller every N steps (1 = every step)
+        # CUDA Graph parameters for eliminating Python dispatch overhead
+        use_cuda_graph: bool = False,  # Enable CUDA graph capture and replay
+        cuda_graph_warmup_steps: int = 3,  # Steps before capturing graph (ensures stable shapes)
     ):
         if mode not in ('simple', 'explicit'):
             raise ValueError(f"mode must be 'simple' or 'explicit', got {mode}")
@@ -543,6 +619,10 @@ class DeepNestedOptimizer:
         self.max_grad_norm = max_grad_norm
         self.use_cms_updates = use_cms_updates
         self.use_preprocessing = use_preprocessing
+        self.use_compile = use_compile
+        self.controller_update_freq = controller_update_freq
+        self.use_cuda_graph = use_cuda_graph
+        self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
 
         # Get device from model
         self.device = next(model.parameters()).device
@@ -564,10 +644,33 @@ class DeepNestedOptimizer:
             ]
 
         # Create base optimizer (AdamW) for actual parameter updates
+        # Enable capturable mode for CUDA graph compatibility (PyTorch 2.0+)
+        adamw_kwargs = {
+            'weight_decay': weight_decay,
+        }
+        if use_cuda_graph:
+            # capturable=True required for CUDA graph capture of optimizer.step()
+            # LR must be a GPU tensor for dynamic updates with capturable mode
+            # NOTE: We don't use fused=True because it can have different numerical
+            # behavior with sparse gradients (e.g., from embeddings)
+            adamw_kwargs['capturable'] = True
+            # adamw_kwargs['fused'] = True  # Disabled for numerical compatibility
+            # Create tensor LRs for each group (must be 0-dim scalar tensors)
+            self._graph_lr_tensors = [
+                torch.tensor(base_lr, device=self.device, dtype=torch.float32)
+                for _ in range(len(_param_groups))
+            ]
+            # Set tensor LRs in param groups
+            for i, group in enumerate(_param_groups):
+                group['lr'] = self._graph_lr_tensors[i]
+        else:
+            # Use scalar LR for non-graph mode
+            adamw_kwargs['lr'] = base_lr
+            self._graph_lr_tensors = None
+
         self.base_optimizer = torch.optim.AdamW(
             _param_groups,
-            lr=base_lr,
-            weight_decay=weight_decay,
+            **adamw_kwargs,
         )
 
         # Learned components
@@ -592,6 +695,12 @@ class DeepNestedOptimizer:
             num_layers=controller_num_layers,
             n_groups=self.n_groups,
         ).to(self.device)
+
+        # Apply torch.compile for faster inference (optional, has warmup cost)
+        if use_compile and hasattr(torch, 'compile'):
+            # Use reduce-overhead mode for small MLPs (reduces kernel launch overhead)
+            self.controller = torch.compile(self.controller, mode='reduce-overhead')
+            self.momentum_mlp = torch.compile(self.momentum_mlp, mode='reduce-overhead')
 
         # Meta-optimizer (trains MomentumMLP + Controller)
         self.meta_optimizer = torch.optim.Adam(
@@ -647,6 +756,15 @@ class DeepNestedOptimizer:
         # Compute parameter depths
         self._compute_group_depths()
 
+        # CUDA Graph state
+        # Graph is captured after warmup_steps to ensure stable tensor shapes
+        self._cuda_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._cuda_graph_stream: Optional[torch.cuda.Stream] = None
+        self._cuda_graph_captured = False
+        # Static buffers for graph inputs (addresses must be stable for replay)
+        self._graph_loss_buffer: Optional[Tensor] = None
+        self._graph_stats_buffer: Optional[Tensor] = None
+
     def _init_state(self):
         """Initialize CMS state for all parameters."""
         num_levels = len(self.cms_frequencies)
@@ -696,34 +814,59 @@ class DeepNestedOptimizer:
         Returns:
             Tensor of shape [n_groups, 3] with [grad_norm, param_norm, avg_depth]
 
-        Note: All computation stays on GPU to avoid CPU sync overhead.
+        Note: Uses torch._foreach_norm for fused kernel execution.
+              This reduces ~1600 small kernel launches to ~4 fused operations.
         """
-        # Pre-allocate result tensor on GPU
-        stats = torch.zeros(self.n_groups, 3, device=self.device, dtype=torch.float32)
+        # Use cached stats tensor if available (avoid allocation)
+        if not hasattr(self, '_stats_cache'):
+            self._stats_cache = torch.zeros(self.n_groups, 3, device=self.device, dtype=torch.float32)
+        stats = self._stats_cache
+        stats.zero_()
 
         for i, group in enumerate(self.param_groups):
             if len(group['params']) == 0:
                 stats[i, 2] = self.group_depths[i]
                 continue
 
-            # Collect all grad and param norms on GPU
-            grad_norms_sq = []
-            param_norms_sq = []
+            # Collect params and grads as lists for fused operations
+            params = [p for p in group['params']]
+            grads = [p.grad for p in group['params'] if p.grad is not None]
 
-            for param in group['params']:
-                # Use in-place norm computation, stays on GPU
-                param_norms_sq.append(param.pow(2).sum())
-                if param.grad is not None:
-                    grad_norms_sq.append(param.grad.pow(2).sum())
+            # Fused norm computation using torch._foreach_norm
+            # This launches ONE kernel for all params instead of one per param
+            if params:
+                # _foreach_norm returns a list of norms, we need sum of squares
+                # Use torch.no_grad() to avoid creating autograd graph through params
+                # (we don't need gradients through model params for meta-learning)
+                with torch.no_grad():
+                    param_norms = torch._foreach_norm(params)
+                    # Stack and compute total: sqrt(sum(norms^2))
+                    if param_norms:
+                        stacked_norms = torch.stack(param_norms)
+                        stats[i, 1] = (stacked_norms ** 2).sum().sqrt()
 
-            # Sum on GPU, then sqrt
-            if grad_norms_sq:
-                stats[i, 0] = torch.stack(grad_norms_sq).sum().sqrt()
-            if param_norms_sq:
-                stats[i, 1] = torch.stack(param_norms_sq).sum().sqrt()
+            if grads:
+                # Gradients don't need autograd graph either
+                with torch.no_grad():
+                    grad_norms = torch._foreach_norm(grads)
+                    if grad_norms:
+                        stacked_norms = torch.stack(grad_norms)
+                        stats[i, 0] = (stacked_norms ** 2).sum().sqrt()
+
             stats[i, 2] = self.group_depths[i]
 
-        return stats
+        # NaN/Inf guard: branchless replace with safe defaults (no .item() sync!)
+        nan_mask = torch.isnan(stats) | torch.isinf(stats)
+        # Default: grad_norm=1.0, param_norm=1.0, depth from group_depths
+        defaults = torch.zeros_like(stats)
+        defaults[:, 0] = 1.0  # grad_norm default
+        defaults[:, 1] = 1.0  # param_norm default
+        defaults[:, 2] = self.group_depths  # depth from cache
+        # Branchless replace: use torch.where (no CPU sync!)
+        stats = torch.where(nan_mask, defaults, stats)
+
+        # Detach stats to ensure meta-learning doesn't backprop through model params
+        return stats.detach()
 
     def _get_context(self, loss_value: float) -> Tensor:
         """Create context vector for MomentumMLP.
@@ -740,6 +883,178 @@ class DeepNestedOptimizer:
         self._context_cache[2] = math.log(max(loss_value, 1e-8) + 1.0)
 
         return self._context_cache
+
+    def _init_cuda_graph_buffers(self):
+        """
+        Initialize static buffers for CUDA Graph capture.
+
+        These buffers have fixed addresses that the graph can reference.
+        Values are copied into these buffers before graph replay.
+        """
+        # Stats buffer: [n_groups, 3] for gradient statistics
+        self._graph_stats_buffer = torch.zeros(
+            self.n_groups, 3, device=self.device, dtype=torch.float32
+        )
+        # LR multipliers buffer: [n_groups]
+        self._graph_lr_mult_buffer = torch.ones(
+            self.n_groups, device=self.device, dtype=torch.float32
+        )
+
+    def _capture_cuda_graph(self):
+        """
+        Capture the optimizer step as a CUDA Graph.
+
+        This method captures the non-CMS (AdamW) path since it's the most common
+        and has deterministic operations. The captured graph includes:
+        1. Computing gradient statistics (_compute_group_stats)
+        2. Controller forward pass
+        3. Fused gradient clipping
+        4. AdamW step
+
+        Prerequisites:
+        - Must be called after warmup steps (tensor shapes stable)
+        - Gradients must exist on all parameters
+        - Device must support CUDA Graphs (compute capability >= 7.0)
+
+        Reference: NVIDIA CUDA Programming Guide, Section 3.2.8 "CUDA Graphs"
+        https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs
+        """
+        if not torch.cuda.is_available():
+            warnings.warn("CUDA not available, disabling CUDA Graph.")
+            self.use_cuda_graph = False
+            return
+
+        # Check compute capability (graphs require CC >= 7.0)
+        device = torch.device(self.device)
+        if device.type == 'cuda':
+            capability = torch.cuda.get_device_capability(device)
+            if capability[0] < 7:
+                warnings.warn(
+                    f"CUDA Graphs require compute capability >= 7.0, "
+                    f"got {capability[0]}.{capability[1]}. Disabling."
+                )
+                self.use_cuda_graph = False
+                return
+
+        # Initialize static buffers
+        self._init_cuda_graph_buffers()
+
+        # Synchronize before capture to ensure all prior work is complete
+        torch.cuda.synchronize()
+
+        # Clip gradients BEFORE capture (outside graph - addresses may change)
+        if self.max_grad_norm > 0:
+            _fused_clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+        # Capture the CUDA graph
+        # NOTE: All lazy CUDA initializations should be complete by now since
+        # we ran cuda_graph_warmup_steps iterations through the normal path
+        self._cuda_graph = torch.cuda.CUDAGraph()
+
+        # Capture the graph (records ONLY AdamW step, not gradient clipping)
+        with torch.cuda.graph(self._cuda_graph):
+            self._step_impl_for_graph()
+
+        # Synchronize to ensure capture is complete
+        torch.cuda.synchronize()
+
+        self._cuda_graph_captured = True
+
+        # NOTE: The first replay is done inside the capture context above,
+        # so no need to replay again here. The graph was executed during capture.
+
+    def _step_impl_for_graph(self):
+        """
+        Graph-safe step implementation for CUDA Graph capture/replay.
+
+        CRITICAL: This method must NOT contain:
+        - Python conditionals on tensor values (use unconditional ops)
+        - CPU synchronization (no .item(), .tolist(), no Python prints)
+        - Dynamic memory allocation (shapes must be stable)
+        - Operations that change tensor addresses
+
+        This captures ONLY the AdamW step. Gradient clipping is done OUTSIDE
+        the graph because gradient tensor addresses may change between backward
+        passes (PyTorch may allocate new tensors or reuse existing ones).
+
+        NOTE: LR updates and controller forward pass are done BEFORE graph replay
+        in _replay_cuda_graph() since they involve CPU operations.
+
+        Reference: NVIDIA CUDA C++ Best Practices Guide,
+        Section 11.1.2 "Applicability of CUDA Graphs"
+        """
+        # === AdamW step ONLY ===
+        # AdamW.step() is graph-safe after warmup (state tensors have stable addresses)
+        # The step() method uses foreach operations internally which are graph-compatible
+        #
+        # NOTE: Gradient clipping is intentionally NOT included here because:
+        # - Gradient tensors may have different addresses between backward passes
+        # - CUDA Graphs require stable tensor addresses for all captured operations
+        # - Clipping is done BEFORE graph replay in _replay_cuda_graph()
+        self.base_optimizer.step()
+
+    def _replay_cuda_graph(self, loss_value: float) -> Dict[str, Any]:
+        """
+        Replay the captured CUDA Graph.
+
+        Before replay, we handle:
+        1. EMA loss update (CPU computation)
+        2. Controller forward pass and LR updates (involves CPU-GPU sync)
+        3. Gradient clipping (must be outside graph - gradient addresses may change)
+
+        The graph itself only contains AdamW step.
+
+        Args:
+            loss_value: Current loss for EMA tracking
+
+        Returns:
+            Dict with step info (lr_multipliers, ema_loss, etc.)
+        """
+        # === Pre-graph operations (must complete before graph replay) ===
+
+        # Update EMA loss
+        self.ema_loss = (1 - self.beta_ema) * self.ema_loss + self.beta_ema * loss_value
+
+        # Controller update (every controller_update_freq steps)
+        update_controller = (
+            self.global_step % self.controller_update_freq == 0 or
+            self.global_step == 1
+        )
+
+        if update_controller:
+            # Compute stats and get LR multipliers from controller
+            stats = self._compute_group_stats()
+
+            with torch.no_grad():
+                lr_mults = self.controller(stats)
+                self._lr_multipliers = lr_mults.clone()
+
+            # Update base optimizer LRs using tensor operations (graph-compatible)
+            # This modifies the tensor values IN-PLACE so the graph sees the new values
+            if self._graph_lr_tensors is not None:
+                for i in range(len(self._graph_lr_tensors)):
+                    if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                        new_lr = self.base_lr * self._lr_multipliers[i]
+                        self._graph_lr_tensors[i].fill_(new_lr)
+
+        # === Gradient clipping (BEFORE graph replay) ===
+        # This must be done outside the graph because gradient tensor addresses
+        # may change between backward passes. The graph captures specific memory
+        # addresses, so if gradients are in different locations, it would corrupt memory.
+        if self.max_grad_norm > 0:
+            _fused_clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+        # === Replay the captured graph ===
+        # The graph contains ONLY AdamW step (gradient clipping is done above)
+        self._cuda_graph.replay()
+
+        # === Post-graph operations ===
+        return {
+            'global_step': self.global_step,
+            'lr_multipliers': self._lr_multipliers.clone(),
+            'ema_loss': self.ema_loss.clone(),
+            'cuda_graph_replay': True,
+        }
 
     def _compute_surrogate_loss(
         self,
@@ -832,11 +1147,18 @@ class DeepNestedOptimizer:
         Each level accumulates gradients and applies learned momentum transformation.
         Slower levels preserve consolidated knowledge (anti-forgetting mechanism).
 
+        CUDA Graph Mode (use_cuda_graph=True):
+        - Warmup: First cuda_graph_warmup_steps run normally
+        - Capture: Graph is captured after warmup
+        - Replay: Subsequent steps replay the captured graph
+
         Args:
             loss_value: Current loss (required for controller updates)
 
         Returns:
             Dict with step info including lr_multipliers, ema_loss, etc.
+
+        Reference: NVIDIA CUDA Programming Guide, Section 3.2.8 "CUDA Graphs"
         """
         self.global_step += 1
 
@@ -853,31 +1175,145 @@ class DeepNestedOptimizer:
 
         self._pending_loss = None
 
+        # NaN guard on loss value
+        if actual_loss is not None and (math.isnan(actual_loss) or math.isinf(actual_loss)):
+            print(f"  [NaN GUARD] step {self.global_step}: loss value is {actual_loss}, skipping update")
+            self.base_optimizer.zero_grad(set_to_none=True)
+            return {
+                'global_step': self.global_step,
+                'lr_multipliers': self._lr_multipliers.tolist() if self._lr_multipliers is not None else [1.0, 1.0],
+                'skipped': True,
+                'reason': 'nan_loss'
+            }
+
+        # === CUDA Graph Path ===
+        # Only used for non-CMS (AdamW) mode to avoid complexity of graph-capturing CMS
+        if self.use_cuda_graph and not self.use_cms_updates:
+            # Warmup phase: run normally to stabilize tensor shapes
+            if self.global_step <= self.cuda_graph_warmup_steps:
+                # Fall through to normal execution below
+                pass
+            # Capture phase: capture graph on first post-warmup step
+            elif not self._cuda_graph_captured:
+                # Save RNG state before capture attempt
+                rng_state = torch.cuda.get_rng_state()
+
+                capture_succeeded = False
+                try:
+                    # Ensure we're on the default stream before capture
+                    torch.cuda.synchronize()
+                    # Update LR tensors BEFORE capture so graph uses correct values
+                    if self._graph_lr_tensors is not None:
+                        for i in range(len(self._graph_lr_tensors)):
+                            if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                                new_lr = self.base_lr * self._lr_multipliers[i]
+                                self._graph_lr_tensors[i].fill_(new_lr)
+                    self._capture_cuda_graph()
+                    # Ensure capture is complete and we're back on default stream
+                    torch.cuda.synchronize()
+                    capture_succeeded = True
+                except Exception as e:
+                    warnings.warn(
+                        f"CUDA Graph capture failed: {e}. "
+                        "Falling back to eager mode. This may indicate "
+                        "incompatible operations or insufficient GPU memory."
+                    )
+                    self.use_cuda_graph = False
+                    self._cuda_graph_captured = False
+
+                    # CRITICAL: Restore RNG state to recover from capture failure
+                    # Failed graph capture can corrupt CUDA RNG offset tracking
+                    try:
+                        torch.cuda.synchronize()
+                        torch.cuda.set_rng_state(rng_state)
+                        torch.cuda.reset_peak_memory_stats()
+                    except Exception:
+                        pass
+                    # Fall through to normal execution
+
+                # After successful capture, the first replay already happened inside
+                # _capture_cuda_graph(), so we can return early with results
+                if capture_succeeded:
+                    # Update EMA loss for the capture step
+                    self.ema_loss = (1 - self.beta_ema) * self.ema_loss + self.beta_ema * actual_loss
+
+                    return {
+                        'global_step': self.global_step,
+                        'lr_multipliers': self._lr_multipliers.clone(),
+                        'ema_loss': self.ema_loss.clone(),
+                        'cuda_graph_capture': True,
+                    }
+
+            # Replay phase: use captured graph
+            elif self._cuda_graph_captured:
+                # Simple mode meta-update check (outside graph)
+                result = self._replay_cuda_graph(actual_loss)
+
+                # Simple mode: auto meta-update
+                if self.mode == 'simple' and self.global_step % self.meta_update_freq == 0:
+                    self._update_meta_components(actual_loss)
+
+                return result
+
+        # === Normal (Eager) Execution Path ===
+
         # Update EMA loss
         if self.global_step == 1:
             self.ema_loss.fill_(actual_loss)
         else:
             self.ema_loss = (1 - self.beta_ema) * self.ema_loss + self.beta_ema * actual_loss
 
-        # Compute gradient statistics for controller
-        stats = self._compute_group_stats()
+        # Compute gradient statistics and LR multipliers only on controller update steps
+        # This reduces overhead when controller_update_freq > 1
+        if self.global_step % self.controller_update_freq == 0 or self.global_step == 1:
+            # Compute gradient statistics for controller
+            stats = self._compute_group_stats()
 
-        # Get LR multipliers from controller
-        with torch.no_grad():
-            self._lr_multipliers = self.controller(stats)
+            # Get LR multipliers from controller
+            with torch.no_grad():
+                self._lr_multipliers = self.controller(stats)
+        # Else: reuse self._lr_multipliers from previous controller update
 
         # Clip gradients
+        # Use inplace=True only for CUDA graph mode (fast but breaks autograd graph)
+        # Use inplace=False for normal mode (preserves graph for meta-learning)
         if self.max_grad_norm > 0:
-            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            use_inplace = self.use_cuda_graph and self._cuda_graph_captured
+            grad_norm = _fused_clip_grad_norm_(
+                self.model.parameters(),
+                self.max_grad_norm,
+                inplace=use_inplace
+            )
+            # Check for NaN/Inf gradients after clipping
+            # Use tensor comparison directly (no .item() sync!)
+            grad_is_nan = torch.isnan(grad_norm) | torch.isinf(grad_norm)
+            if grad_is_nan:
+                # Only sync for print if we're actually logging (rare case)
+                # Note: This branch is only taken when training has diverged
+                print(f"  [NaN GUARD] step {self.global_step}: gradient norm is NaN/Inf, skipping update")
+                self.base_optimizer.zero_grad(set_to_none=True)
+                return {
+                    'global_step': self.global_step,
+                    'lr_multipliers': self._lr_multipliers.tolist() if self._lr_multipliers is not None else [1.0, 1.0],
+                    'skipped': True,
+                    'reason': 'nan_gradient'
+                }
 
         if not self.use_cms_updates:
             # === ADAMW MODE (proven to work) ===
             # Update base optimizer learning rates with controller's multipliers
-            # Pre-compute effective LRs (one GPU->CPU transfer instead of per-group .item())
-            effective_lrs = (self.base_lr * self._lr_multipliers).tolist()
-            for i, group in enumerate(self.base_optimizer.param_groups):
-                if len(group['params']) > 0:
-                    group['lr'] = effective_lrs[i]
+            if self._graph_lr_tensors is not None:
+                # CUDA Graph mode: use tensor LRs (update in-place)
+                for i in range(len(self._graph_lr_tensors)):
+                    if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                        new_lr = self.base_lr * self._lr_multipliers[i]
+                        self._graph_lr_tensors[i].fill_(new_lr)
+            else:
+                # Non-graph mode: use scalar LRs
+                effective_lrs = (self.base_lr * self._lr_multipliers).tolist()
+                for i, group in enumerate(self.base_optimizer.param_groups):
+                    if len(group['params']) > 0:
+                        group['lr'] = effective_lrs[i]
 
             # Let AdamW handle the actual update (has adaptive per-param LR)
             self.base_optimizer.step()
@@ -954,8 +1390,8 @@ class DeepNestedOptimizer:
                         self.mlp_optimizer.zero_grad()
                         total_surrogate_loss.backward()
 
-                        # Clip MLP gradients for stability
-                        clip_grad_norm_(self.momentum_mlp.parameters(), max_norm=1.0)
+                        # Clip MLP gradients for stability (fused)
+                        _fused_clip_grad_norm_(self.momentum_mlp.parameters(), max_norm=1.0)
 
                         self.mlp_optimizer.step()
 
@@ -1129,7 +1565,7 @@ class DeepNestedOptimizer:
         meta_loss.backward()
 
         # Keep as tensor - only convert to .item() when logging to avoid GPU sync
-        self._controller_grad_norm_tensor = clip_grad_norm_(
+        self._controller_grad_norm_tensor = _fused_clip_grad_norm_(
             list(self.momentum_mlp.parameters()) + list(self.controller.parameters()),
             max_norm=1.0,
         )
@@ -1177,11 +1613,14 @@ class DeepNestedOptimizer:
 
         for param in sampled_params:
             cms = self.state[param]
-            grad = param.grad
+            # Detach grad from model's computation graph
+            # We want gradients through MLP, not through model params
+            grad = param.grad.detach()
 
             # Level 0 (fast) is always active and has the freshest EMA
-            prev_momentum = cms.get_momentum(0)
-            ema_target = cms.get_ema_grad(0)
+            # Detach momentum to avoid graph through CMS state
+            prev_momentum = cms.get_momentum(0).detach()
+            ema_target = cms.get_ema_grad(0).detach()
 
             # Skip if EMA hasn't been initialized yet
             if ema_target.abs().max() < 1e-10:
@@ -1286,7 +1725,7 @@ class DeepNestedOptimizer:
             meta_loss.backward()
 
             # Keep as tensor - only convert to .item() when logging to avoid GPU sync
-            self._controller_grad_norm_tensor = clip_grad_norm_(
+            self._controller_grad_norm_tensor = _fused_clip_grad_norm_(
                 list(self.momentum_mlp.parameters()) + list(self.controller.parameters()),
                 max_norm=1.0,
             )

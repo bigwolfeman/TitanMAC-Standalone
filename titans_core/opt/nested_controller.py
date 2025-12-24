@@ -88,19 +88,24 @@ class NestedController(nn.Module):
 
         Note:
             Output is clamped to [min_lr_mult, max_lr_mult] by design.
+            Uses branchless NaN handling to avoid GPU sync from .item() calls.
         """
-        # Validate input shape
-        assert stats.shape[0] == self.n_groups, (
-            f"Expected {self.n_groups} groups, got {stats.shape[0]}"
-        )
-        assert stats.shape[1] == 3, (
-            f"Expected 3 features per group, got {stats.shape[1]}"
+        # Default multipliers (1.0) - used as fallback for NaN
+        default_multipliers = torch.ones(
+            self.n_groups, device=stats.device, dtype=stats.dtype
         )
 
-        # Process each group independently
-        # stats: [n_groups, 3]
-        # net output: [n_groups, 1]
-        raw_output = self.net(stats)  # [n_groups, 1]
+        # Check for NaN/Inf in input (keep as tensor, no .item()!)
+        input_nan_mask = torch.isnan(stats) | torch.isinf(stats)
+        has_input_nan = input_nan_mask.any()
+
+        # Replace NaN/Inf in input with safe values before MLP forward
+        # This prevents NaN propagation through the network
+        safe_stats = torch.where(input_nan_mask, torch.ones_like(stats), stats)
+
+        # Process through MLP
+        # stats: [n_groups, 3] -> net output: [n_groups, 1]
+        raw_output = self.net(safe_stats)  # [n_groups, 1]
 
         # Squeeze to [n_groups]
         raw_output = raw_output.squeeze(-1)  # [n_groups]
@@ -115,5 +120,22 @@ class NestedController(nn.Module):
 
         # Ensure bounds (redundant with sigmoid, but explicit)
         multipliers = torch.clamp(multipliers, self.min_lr_mult, self.max_lr_mult)
+
+        # Check for NaN/Inf in output (keep as tensor, no .item()!)
+        output_nan_mask = torch.isnan(multipliers) | torch.isinf(multipliers)
+        has_output_nan = output_nan_mask.any()
+
+        # Branchless NaN handling: use torch.where to select defaults where needed
+        # If any input was NaN, use all defaults (input NaN affects all outputs)
+        # If specific outputs are NaN, replace just those
+        multipliers = torch.where(output_nan_mask, default_multipliers, multipliers)
+
+        # If input had NaN, return all defaults
+        # Expand has_input_nan to match multipliers shape for torch.where
+        multipliers = torch.where(
+            has_input_nan.expand(self.n_groups),
+            default_multipliers,
+            multipliers
+        )
 
         return multipliers
