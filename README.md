@@ -125,4 +125,5 @@ titans_core/
 
 ## License
 
-MIT
+GPL
+
