@@ -13,12 +13,14 @@ Tasks: T048-T051
 """
 
 from typing import Dict, Any, List, Optional
+
 import torch
 import torch.nn as nn
 
 from .nested_controller import NestedController
 from .param_groups import group_titans_params, infer_param_depth
 from .cms import ContinuumMemorySystem
+from .meta_trainer import SimplifiedMetaTrainer
 
 
 class ContinuumOptimizer:
@@ -126,6 +128,7 @@ class ContinuumOptimizer:
         self.ema_loss = torch.zeros(self.n_groups)
         self._lr_multipliers = torch.ones(self.n_groups)
         self._pending_loss = None  # For set_loss() / step() workflow
+        self.last_meta_loss = None  # For compatibility with DeepNestedOptimizer interface
 
         # Compute parameter depths for each group
         self._compute_group_depths()
@@ -145,6 +148,13 @@ class ContinuumOptimizer:
             )
         else:
             self.cms = None
+
+        # Simplified meta-trainer for proper meta-loss computation
+        # This replaces the broken pure-regularization approach
+        self.meta_trainer = SimplifiedMetaTrainer(
+            window_size=100,
+            improvement_threshold=0.001,
+        )
 
     def set_loss(self, loss_value: float) -> None:
         """Set the loss value for the next controller update.
@@ -320,10 +330,20 @@ class ContinuumOptimizer:
             if len(group["params"]) > 0:  # Skip empty groups
                 group["lr"] = self.base_lr * self._lr_multipliers[i].item()
 
-        # Controller meta-objective: Encourage stable learning rates
-        # Use L2 penalty on deviation from 1.0 (neutral multiplier)
-        # This prevents controller from making extreme adjustments
-        meta_loss = ((multipliers - 1.0) ** 2).mean()
+        # Record step in meta-trainer for loss-improvement tracking
+        self.meta_trainer.record_step(
+            loss=loss_value,
+            multipliers=multipliers.detach(),
+            momentum_norm=0.0,  # Not tracking momentum in ContinuumOptimizer
+        )
+
+        # Controller meta-objective: Use loss-improvement-based proxy loss
+        # This replaces the broken pure-regularization approach
+        meta_loss = self.meta_trainer.compute_proxy_loss(
+            current_multipliers=multipliers,
+            current_loss=loss_value,
+        )
+        self.last_meta_loss = meta_loss.detach()  # Store for logging
 
         # Update controller
         self.controller_optimizer.zero_grad()
@@ -347,38 +367,44 @@ class ContinuumOptimizer:
         """
         Compute gradient statistics for each parameter group.
 
+        Uses torch._foreach_norm for batched GPU computation, avoiding
+        per-parameter .item() calls that cause CPU-GPU synchronization.
+
         Returns:
-            Tensor of shape [n_groups, 3] with:
-            - grad_norm: L2 norm of gradients
-            - param_norm: L2 norm of parameters
-            - avg_depth: Average depth of parameters
+            Tensor of shape [n_groups, 3] with normalized stats:
+            - log_grad_norm: Log-scaled gradient norm (handles large range)
+            - log_param_norm: Log-scaled parameter norm
+            - avg_depth: Average depth of parameters (already in [0, 1])
         """
-        stats = []
+        device = next(self.model.parameters()).device
+        stats = torch.zeros(self.n_groups, 3, device=device, dtype=torch.float32)
 
         for i, group in enumerate(self.base_optimizer.param_groups):
+            # Set depth (already a tensor)
+            stats[i, 2] = self.group_depths[i]
+
             if len(group["params"]) == 0:
-                # Empty group: use default stats
-                stats.append([0.0, 0.0, self.group_depths[i].item()])
                 continue
 
-            # Compute gradient norm
-            grad_norm = 0.0
-            param_norm = 0.0
+            # Collect gradients and params as flat views for batched norm
+            grads = [p.grad.view(-1) for p in group["params"] if p.grad is not None]
+            params = [p.view(-1) for p in group["params"]]
 
-            for param in group["params"]:
-                if param.grad is not None:
-                    grad_norm += param.grad.norm().item() ** 2
-                param_norm += param.norm().item() ** 2
+            # Batched gradient norm using fused kernel
+            if grads:
+                grad_norms = torch._foreach_norm(grads)
+                grad_norm_sq = torch.stack(grad_norms).pow(2).sum()
+                grad_norm = grad_norm_sq.sqrt()
+                # Log-scale on GPU: log1p(x) / 10 -> ~[0, 1] for typical norms
+                stats[i, 0] = torch.log1p(grad_norm) / 10.0
 
-            grad_norm = grad_norm ** 0.5
-            param_norm = param_norm ** 0.5
+            # Batched param norm using fused kernel
+            param_norms = torch._foreach_norm(params)
+            param_norm_sq = torch.stack(param_norms).pow(2).sum()
+            param_norm = param_norm_sq.sqrt()
+            stats[i, 1] = torch.log1p(param_norm) / 10.0
 
-            # Average depth for this group
-            avg_depth = self.group_depths[i].item()
-
-            stats.append([grad_norm, param_norm, avg_depth])
-
-        return torch.tensor(stats, dtype=torch.float32)
+        return stats
 
     def zero_grad(self, set_to_none: bool = True):
         """
