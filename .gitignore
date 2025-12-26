@@ -1,4 +1,9 @@
 .specify/
+.claude/
+.beads/
+wandb/
+results/
+Ai-notes/
 # Python
 __pycache__/
 *.py[cod]

@@ -1,0 +1,8 @@
+[project]
+name = "TitanMAC"
+id = "titanmac"
+description = ""
+
+[rag]
+include = ["src/**/*.py", "docs/*.md"]
+exclude = ["tests/", "legacy/"]
