@@ -13,7 +13,7 @@ Date: 2025-12-26
 Branch: 001-cms-block-sparse
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -144,9 +144,11 @@ def create_block_ell_from_dense(
 
     Raises:
         ValueError: If dimensions not divisible by tile_size
-        NotImplementedError: Skeleton - not yet implemented
     """
-    raise NotImplementedError("create_block_ell_from_dense not yet implemented")
+    # Note: selection_method is currently ignored (only magnitude-based is implemented)
+    values, col_indices, R, C, K, B = from_dense(dense, tile_size, density)
+    config = BlockELLConfig(R=R, C=C, K=K, B=B)
+    return BlockELLTensor(values=values, col_indices=col_indices.to(torch.int32), config=config)
 
 
 def block_ell_to_dense(block_ell: BlockELLTensor) -> Tensor:
@@ -157,11 +159,16 @@ def block_ell_to_dense(block_ell: BlockELLTensor) -> Tensor:
 
     Returns:
         Dense weight matrix [out_features, in_features]
-
-    Raises:
-        NotImplementedError: Skeleton - not yet implemented
     """
-    raise NotImplementedError("block_ell_to_dense not yet implemented")
+    cfg = block_ell.config
+    return to_dense(
+        values=block_ell.values,
+        col_indices=block_ell.col_indices,
+        R=cfg.R,
+        C=cfg.C,
+        K=cfg.K,
+        B=cfg.B,
+    )
 
 
 def validate_block_ell_topology(block_ell: BlockELLTensor) -> Tuple[bool, Optional[str]]:
@@ -176,11 +183,18 @@ def validate_block_ell_topology(block_ell: BlockELLTensor) -> Tuple[bool, Option
 
     Returns:
         Tuple of (is_valid, error_message or None)
-
-    Raises:
-        NotImplementedError: Skeleton - not yet implemented
     """
-    raise NotImplementedError("validate_block_ell_topology not yet implemented")
+    cfg = block_ell.config
+    # Create a BlockELLFormat to use its validate() method
+    block_ell_format = BlockELLFormat(
+        R=cfg.R,
+        C=cfg.C,
+        K=cfg.K,
+        B=cfg.B,
+        values=block_ell.values,
+        col_indices=block_ell.col_indices,
+    )
+    return block_ell_format.validate()
 
 
 def initialize_block_ell_topology(
@@ -201,9 +215,34 @@ def initialize_block_ell_topology(
         col_indices tensor [R, K] with int32 dtype
 
     Raises:
-        NotImplementedError: Skeleton - not yet implemented
+        ValueError: If method is not supported
     """
-    raise NotImplementedError("initialize_block_ell_topology not yet implemented")
+    if method == "random":
+        col_indices = create_random_topology(
+            R=config.R,
+            C=config.C,
+            K=config.K,
+            generator=generator,
+            device=device,
+            dtype=torch.int32,
+        )
+        return col_indices
+    elif method == "strided":
+        # Strided: evenly spaced columns
+        col_indices = torch.zeros(config.R, config.K, dtype=torch.int32, device=device)
+        stride = config.C // config.K
+        for k in range(config.K):
+            col_indices[:, k] = min(k * stride, config.C - 1)
+        return col_indices
+    elif method == "first_k":
+        # First K: select columns 0, 1, ..., K-1
+        col_indices = torch.arange(config.K, dtype=torch.int32, device=device)
+        col_indices = col_indices.unsqueeze(0).expand(config.R, -1).clone()
+        return col_indices
+    else:
+        raise ValueError(
+            f"Unknown initialization method: {method}. Supported: random, strided, first_k"
+        )
 
 
 @dataclass
@@ -476,13 +515,9 @@ def from_dense(
 
     # Validate dimensions are divisible by tile_size
     if out_features % B != 0:
-        raise ValueError(
-            f"out_features ({out_features}) must be divisible by tile_size ({B})"
-        )
+        raise ValueError(f"out_features ({out_features}) must be divisible by tile_size ({B})")
     if in_features % B != 0:
-        raise ValueError(
-            f"in_features ({in_features}) must be divisible by tile_size ({B})"
-        )
+        raise ValueError(f"in_features ({in_features}) must be divisible by tile_size ({B})")
 
     R = out_features // B
     C = in_features // B

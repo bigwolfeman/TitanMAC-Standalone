@@ -17,7 +17,7 @@ Key features:
 - GradScaler compatible for mixed-precision training
 """
 
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import math
 import warnings
 
@@ -25,7 +25,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.nn.utils import clip_grad_norm_
 
 from .nested_controller import NestedController
 from .param_groups import group_moe_params, infer_param_depth
@@ -68,10 +67,10 @@ def _fused_clip_grad_norm_(
     if len(grads) == 0:
         return torch.tensor(0.0)
 
-    device = grads[0].device
-    dtype = grads[0].dtype
+    grads[0].device
+    grads[0].dtype
 
-    if norm_type == float('inf'):
+    if norm_type == float("inf"):
         # Max norm: find max absolute value across all grads
         norms = [g.abs().max() for g in grads]
         total_norm = torch.stack(norms).max()
@@ -79,12 +78,12 @@ def _fused_clip_grad_norm_(
         # Use fused foreach_norm for p-norm
         norms = torch._foreach_norm(grads, ord=norm_type)
         stacked = torch.stack(norms)
-        total_norm = (stacked ** norm_type).sum() ** (1.0 / norm_type)
+        total_norm = (stacked**norm_type).sum() ** (1.0 / norm_type)
 
     if error_if_nonfinite and (torch.isnan(total_norm) or torch.isinf(total_norm)):
         raise RuntimeError(
-            f'The total norm of order {norm_type} for gradients from '
-            f'`parameters` is non-finite, so it cannot be clipped.'
+            f"The total norm of order {norm_type} for gradients from "
+            f"`parameters` is non-finite, so it cannot be clipped."
         )
 
     # Clip gradients
@@ -135,12 +134,12 @@ def preprocess_gradient(g: Tensor, p: float = 10.0) -> Tuple[Tensor, Tensor]:
     log_g = torch.where(
         abs_g >= threshold,
         torch.log(abs_g) / p,  # Normalized log (in range [-1, ~1] for typical gradients)
-        torch.full_like(g, -1.0)  # Indicator for "small"
+        torch.full_like(g, -1.0),  # Indicator for "small"
     )
     sign_g = torch.where(
         abs_g >= threshold,
         g.sign(),  # Just the sign
-        exp_p * g  # Linear scaling for small values (scalar * tensor is efficient)
+        exp_p * g,  # Linear scaling for small values (scalar * tensor is efficient)
     )
     return log_g, sign_g
 
@@ -374,7 +373,7 @@ class DirectUpdateMLP(nn.Module):
         """
         original_shape = grad.shape
         grad_flat = grad.flatten()
-        n_elements = grad_flat.numel()
+        grad_flat.numel()
 
         # Preprocess gradient
         log_g, sign_g = preprocess_gradient(grad_flat)
@@ -431,66 +430,66 @@ class ContinuumMemoryState:
         self.param_shape = param_shape
         self.num_levels = num_levels
         self.base_frequency = base_frequency
-        self.device = device or torch.device('cpu')
+        self.device = device or torch.device("cpu")
 
         # Initialize per-level state
         self.levels: Dict[int, Dict[str, Any]] = {}
         for level in range(num_levels):
-            freq = base_frequency ** level  # 1, 10, 100
+            freq = base_frequency**level  # 1, 10, 100
             self.levels[level] = {
-                'frequency': freq,
-                'momentum': torch.zeros(param_shape, device=self.device),
-                'step_count': 0,
-                'ema_decay': 0.99 ** (1.0 / freq),  # Slower decay at higher levels
-                'accumulated_grad': torch.zeros(param_shape, device=self.device),
+                "frequency": freq,
+                "momentum": torch.zeros(param_shape, device=self.device),
+                "step_count": 0,
+                "ema_decay": 0.99 ** (1.0 / freq),  # Slower decay at higher levels
+                "accumulated_grad": torch.zeros(param_shape, device=self.device),
                 # Paper-aligned additions:
-                'ema_grad': torch.zeros(param_shape, device=self.device),  # L2 regression target
-                'v_sq': torch.zeros(param_shape, device=self.device),  # Second-moment (Adam-style)
-                'beta2': 0.999,  # Standard Adam beta2 for variance tracking
+                "ema_grad": torch.zeros(param_shape, device=self.device),  # L2 regression target
+                "v_sq": torch.zeros(param_shape, device=self.device),  # Second-moment (Adam-style)
+                "beta2": 0.999,  # Standard Adam beta2 for variance tracking
             }
 
     def should_update(self, level: int, global_step: int) -> bool:
         """Check if this level should update at the current step."""
         if level not in self.levels:
             return False
-        return global_step % self.levels[level]['frequency'] == 0
+        return global_step % self.levels[level]["frequency"] == 0
 
     def accumulate_grad(self, grad: Tensor):
         """Accumulate gradient for all levels (called every step)."""
         for level_state in self.levels.values():
-            level_state['accumulated_grad'] += grad
+            level_state["accumulated_grad"] += grad
 
     def get_update(self, level: int) -> Tensor:
         """Get accumulated gradient for a level and reset accumulator."""
         state = self.levels[level]
-        update = state['accumulated_grad'].clone()
-        state['accumulated_grad'].zero_()
-        state['step_count'] += 1
+        update = state["accumulated_grad"].clone()
+        state["accumulated_grad"].zero_()
+        state["step_count"] += 1
         return update
 
     def update_momentum(self, level: int, new_momentum: Tensor):
         """Update momentum for a specific level."""
-        self.levels[level]['momentum'] = new_momentum
+        self.levels[level]["momentum"] = new_momentum
 
     def get_momentum(self, level: int) -> Tensor:
         """Get current momentum for a level."""
-        return self.levels[level]['momentum']
+        return self.levels[level]["momentum"]
 
     def update_ema_grad(self, level: int, grad: Tensor):
         """Update EMA gradient for L2 regression target (paper-aligned)."""
         state = self.levels[level]
-        decay = state['ema_decay']
-        state['ema_grad'] = decay * state['ema_grad'] + (1 - decay) * grad
+        decay = state["ema_decay"]
+        state["ema_grad"] = decay * state["ema_grad"] + (1 - decay) * grad
 
     def get_ema_grad(self, level: int) -> Tensor:
         """Get EMA gradient target for L2 regression."""
-        return self.levels[level]['ema_grad']
+        return self.levels[level]["ema_grad"]
 
     def update_second_moment(self, level: int, grad: Tensor):
         """Update running variance estimate (Adam-style v_t) for adaptive LR."""
         state = self.levels[level]
-        beta2 = state['beta2']
-        state['v_sq'] = beta2 * state['v_sq'] + (1 - beta2) * grad.pow(2)
+        beta2 = state["beta2"]
+        state["v_sq"] = beta2 * state["v_sq"] + (1 - beta2) * grad.pow(2)
 
     def get_adaptive_lr(self, level: int, eps: float = 1e-8) -> Tensor:
         """Get per-parameter adaptive learning rate from second moment.
@@ -499,13 +498,13 @@ class ContinuumMemoryState:
         When v_sq is still near zero (early training), returns 1.0 (no adaptation).
         """
         state = self.levels[level]
-        v_sq = state['v_sq']
-        step_count = state['step_count']
+        v_sq = state["v_sq"]
+        step_count = state["step_count"]
 
         # Bias correction (like Adam)
         if step_count > 0:
-            beta2 = state['beta2']
-            bias_correction = 1 - (beta2 ** step_count)
+            beta2 = state["beta2"]
+            bias_correction = 1 - (beta2**step_count)
             v_sq_corrected = v_sq / bias_correction
         else:
             # No updates yet - return no adaptation
@@ -518,14 +517,14 @@ class ContinuumMemoryState:
 
         return adaptive_lr
 
-    def to(self, device: torch.device) -> 'ContinuumMemoryState':
+    def to(self, device: torch.device) -> "ContinuumMemoryState":
         """Move all tensors to device."""
         self.device = device
         for level_state in self.levels.values():
-            level_state['momentum'] = level_state['momentum'].to(device)
-            level_state['accumulated_grad'] = level_state['accumulated_grad'].to(device)
-            level_state['ema_grad'] = level_state['ema_grad'].to(device)
-            level_state['v_sq'] = level_state['v_sq'].to(device)
+            level_state["momentum"] = level_state["momentum"].to(device)
+            level_state["accumulated_grad"] = level_state["accumulated_grad"].to(device)
+            level_state["ema_grad"] = level_state["ema_grad"].to(device)
+            level_state["v_sq"] = level_state["v_sq"].to(device)
         return self
 
 
@@ -584,7 +583,7 @@ class DeepNestedOptimizer:
         controller_hidden_dim: int = 32,
         controller_num_layers: int = 2,
         use_gradient_checkpointing: bool = True,
-        mode: str = 'simple',
+        mode: str = "simple",
         meta_update_freq: int = 100,
         weight_decay: float = 0.0,
         max_grad_norm: float = 1.0,
@@ -600,7 +599,7 @@ class DeepNestedOptimizer:
         use_cuda_graph: bool = False,  # Enable CUDA graph capture and replay
         cuda_graph_warmup_steps: int = 3,  # Steps before capturing graph (ensures stable shapes)
     ):
-        if mode not in ('simple', 'explicit'):
+        if mode not in ("simple", "explicit"):
             raise ValueError(f"mode must be 'simple' or 'explicit', got {mode}")
 
         self.model = model
@@ -634,26 +633,26 @@ class DeepNestedOptimizer:
         # Handle empty embed group (unlikely but possible)
         if len(embed_params) == 0:
             _param_groups = [
-                {'params': core_params, 'lr': base_lr, 'name': 'core'},
-                {'params': [], 'lr': base_lr, 'name': 'embed'},
+                {"params": core_params, "lr": base_lr, "name": "core"},
+                {"params": [], "lr": base_lr, "name": "embed"},
             ]
         else:
             _param_groups = [
-                {'params': core_params, 'lr': base_lr, 'name': 'core'},
-                {'params': embed_params, 'lr': base_lr, 'name': 'embed'},
+                {"params": core_params, "lr": base_lr, "name": "core"},
+                {"params": embed_params, "lr": base_lr, "name": "embed"},
             ]
 
         # Create base optimizer (AdamW) for actual parameter updates
         # Enable capturable mode for CUDA graph compatibility (PyTorch 2.0+)
         adamw_kwargs = {
-            'weight_decay': weight_decay,
+            "weight_decay": weight_decay,
         }
         if use_cuda_graph:
             # capturable=True required for CUDA graph capture of optimizer.step()
             # LR must be a GPU tensor for dynamic updates with capturable mode
             # NOTE: We don't use fused=True because it can have different numerical
             # behavior with sparse gradients (e.g., from embeddings)
-            adamw_kwargs['capturable'] = True
+            adamw_kwargs["capturable"] = True
             # adamw_kwargs['fused'] = True  # Disabled for numerical compatibility
             # Create tensor LRs for each group (must be 0-dim scalar tensors)
             self._graph_lr_tensors = [
@@ -662,10 +661,10 @@ class DeepNestedOptimizer:
             ]
             # Set tensor LRs in param groups
             for i, group in enumerate(_param_groups):
-                group['lr'] = self._graph_lr_tensors[i]
+                group["lr"] = self._graph_lr_tensors[i]
         else:
             # Use scalar LR for non-graph mode
-            adamw_kwargs['lr'] = base_lr
+            adamw_kwargs["lr"] = base_lr
             self._graph_lr_tensors = None
 
         self.base_optimizer = torch.optim.AdamW(
@@ -697,15 +696,14 @@ class DeepNestedOptimizer:
         ).to(self.device)
 
         # Apply torch.compile for faster inference (optional, has warmup cost)
-        if use_compile and hasattr(torch, 'compile'):
+        if use_compile and hasattr(torch, "compile"):
             # Use reduce-overhead mode for small MLPs (reduces kernel launch overhead)
-            self.controller = torch.compile(self.controller, mode='reduce-overhead')
-            self.momentum_mlp = torch.compile(self.momentum_mlp, mode='reduce-overhead')
+            self.controller = torch.compile(self.controller, mode="reduce-overhead")
+            self.momentum_mlp = torch.compile(self.momentum_mlp, mode="reduce-overhead")
 
         # Meta-optimizer (trains MomentumMLP + Controller)
         self.meta_optimizer = torch.optim.Adam(
-            list(self.momentum_mlp.parameters()) +
-            list(self.controller.parameters()),
+            list(self.momentum_mlp.parameters()) + list(self.controller.parameters()),
             lr=meta_lr,
         )
 
@@ -756,6 +754,9 @@ class DeepNestedOptimizer:
         # Compute parameter depths
         self._compute_group_depths()
 
+        # T089: Discover and cache block-sparse layers during init for faster access
+        self._block_sparse_layers = self.discover_block_sparse_layers()
+
         # CUDA Graph state
         # Graph is captured after warmup_steps to ensure stable tensor shapes
         self._cuda_graph: Optional[torch.cuda.CUDAGraph] = None
@@ -769,7 +770,7 @@ class DeepNestedOptimizer:
         """Initialize CMS state for all parameters."""
         num_levels = len(self.cms_frequencies)
         for group in self.param_groups:
-            for param in group['params']:
+            for param in group["params"]:
                 self.state[param] = ContinuumMemoryState(
                     param_shape=param.shape,
                     num_levels=num_levels,
@@ -779,28 +780,30 @@ class DeepNestedOptimizer:
 
     def _compute_group_depths(self):
         """Compute average depth for each parameter group."""
-        if hasattr(self.model, 'config') and hasattr(self.model.config, 'n_layers'):
+        if hasattr(self.model, "config") and hasattr(self.model.config, "n_layers"):
             n_layers = self.model.config.n_layers
-        elif hasattr(self.model, 'transformer_blocks'):
+        elif hasattr(self.model, "transformer_blocks"):
             n_layers = len(self.model.transformer_blocks)
-        elif hasattr(self.model, 'layers'):
+        elif hasattr(self.model, "layers"):
             n_layers = len(self.model.layers)
         else:
             n_layers = 1
 
+        # Build param-to-name mapping once: O(N) instead of O(N²) nested lookup
+        param_to_name = {p: name for name, p in self.model.named_parameters()}
+
         self.group_depths = []
         for group in self.param_groups:
-            if len(group['params']) == 0:
+            if len(group["params"]) == 0:
                 self.group_depths.append(0.5)
                 continue
 
             depths = []
-            for param in group['params']:
-                for name, p in self.model.named_parameters():
-                    if p is param:
-                        depth = infer_param_depth(name, n_layers)
-                        depths.append(depth)
-                        break
+            for param in group["params"]:
+                name = param_to_name.get(param)
+                if name is not None:
+                    depth = infer_param_depth(name, n_layers)
+                    depths.append(depth)
 
             avg_depth = sum(depths) / len(depths) if depths else 0.5
             self.group_depths.append(avg_depth)
@@ -818,19 +821,21 @@ class DeepNestedOptimizer:
               This reduces ~1600 small kernel launches to ~4 fused operations.
         """
         # Use cached stats tensor if available (avoid allocation)
-        if not hasattr(self, '_stats_cache'):
-            self._stats_cache = torch.zeros(self.n_groups, 3, device=self.device, dtype=torch.float32)
+        if not hasattr(self, "_stats_cache"):
+            self._stats_cache = torch.zeros(
+                self.n_groups, 3, device=self.device, dtype=torch.float32
+            )
         stats = self._stats_cache
         stats.zero_()
 
         for i, group in enumerate(self.param_groups):
-            if len(group['params']) == 0:
+            if len(group["params"]) == 0:
                 stats[i, 2] = self.group_depths[i]
                 continue
 
             # Collect params and grads as lists for fused operations
-            params = [p for p in group['params']]
-            grads = [p.grad for p in group['params'] if p.grad is not None]
+            params = [p for p in group["params"]]
+            grads = [p.grad for p in group["params"] if p.grad is not None]
 
             # Fused norm computation using torch._foreach_norm
             # This launches ONE kernel for all params instead of one per param
@@ -843,7 +848,7 @@ class DeepNestedOptimizer:
                     # Stack and compute total: sqrt(sum(norms^2))
                     if param_norms:
                         stacked_norms = torch.stack(param_norms)
-                        stats[i, 1] = (stacked_norms ** 2).sum().sqrt()
+                        stats[i, 1] = (stacked_norms**2).sum().sqrt()
 
             if grads:
                 # Gradients don't need autograd graph either
@@ -851,7 +856,7 @@ class DeepNestedOptimizer:
                     grad_norms = torch._foreach_norm(grads)
                     if grad_norms:
                         stacked_norms = torch.stack(grad_norms)
-                        stats[i, 0] = (stacked_norms ** 2).sum().sqrt()
+                        stats[i, 0] = (stacked_norms**2).sum().sqrt()
 
             stats[i, 2] = self.group_depths[i]
 
@@ -874,7 +879,7 @@ class DeepNestedOptimizer:
         Uses cached tensor to avoid CPU->GPU transfer overhead.
         """
         # Lazy init cached context tensor
-        if not hasattr(self, '_context_cache'):
+        if not hasattr(self, "_context_cache"):
             self._context_cache = torch.zeros(3, device=self.device, dtype=torch.float32)
 
         # Update in-place on GPU (no CPU->GPU transfer)
@@ -926,7 +931,7 @@ class DeepNestedOptimizer:
 
         # Check compute capability (graphs require CC >= 7.0)
         device = torch.device(self.device)
-        if device.type == 'cuda':
+        if device.type == "cuda":
             capability = torch.cuda.get_device_capability(device)
             if capability[0] < 7:
                 warnings.warn(
@@ -1017,8 +1022,7 @@ class DeepNestedOptimizer:
 
         # Controller update (every controller_update_freq steps)
         update_controller = (
-            self.global_step % self.controller_update_freq == 0 or
-            self.global_step == 1
+            self.global_step % self.controller_update_freq == 0 or self.global_step == 1
         )
 
         if update_controller:
@@ -1033,7 +1037,7 @@ class DeepNestedOptimizer:
             # This modifies the tensor values IN-PLACE so the graph sees the new values
             if self._graph_lr_tensors is not None:
                 for i in range(len(self._graph_lr_tensors)):
-                    if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                    if len(self.base_optimizer.param_groups[i]["params"]) > 0:
                         new_lr = self.base_lr * self._lr_multipliers[i]
                         self._graph_lr_tensors[i].fill_(new_lr)
 
@@ -1050,10 +1054,10 @@ class DeepNestedOptimizer:
 
         # === Post-graph operations ===
         return {
-            'global_step': self.global_step,
-            'lr_multipliers': self._lr_multipliers.clone(),
-            'ema_loss': self.ema_loss.clone(),
-            'cuda_graph_replay': True,
+            "global_step": self.global_step,
+            "lr_multipliers": self._lr_multipliers.clone(),
+            "ema_loss": self.ema_loss.clone(),
+            "cuda_graph_replay": True,
         }
 
     def _compute_surrogate_loss(
@@ -1162,10 +1166,17 @@ class DeepNestedOptimizer:
         """
         self.global_step += 1
 
+        # T090: Accumulate gradient scores for block-sparse layers
+        # This must happen AFTER backward() (externally called) but BEFORE weight updates
+        # Only accumulate if gradients exist
+        for layer in self._block_sparse_layers:
+            if layer.values.grad is not None:
+                layer.accumulate_scores()
+
         # Get loss value
         actual_loss = loss_value if loss_value is not None else self._pending_loss
         if actual_loss is None:
-            if not hasattr(self, '_warned_no_loss'):
+            if not hasattr(self, "_warned_no_loss"):
                 warnings.warn(
                     "DeepNestedOptimizer: No loss_value provided. "
                     "Call optimizer.set_loss(value) before step() or pass directly."
@@ -1177,13 +1188,19 @@ class DeepNestedOptimizer:
 
         # NaN guard on loss value
         if actual_loss is not None and (math.isnan(actual_loss) or math.isinf(actual_loss)):
-            print(f"  [NaN GUARD] step {self.global_step}: loss value is {actual_loss}, skipping update")
+            print(
+                f"  [NaN GUARD] step {self.global_step}: loss value is {actual_loss}, skipping update"
+            )
             self.base_optimizer.zero_grad(set_to_none=True)
             return {
-                'global_step': self.global_step,
-                'lr_multipliers': self._lr_multipliers.tolist() if self._lr_multipliers is not None else [1.0, 1.0],
-                'skipped': True,
-                'reason': 'nan_loss'
+                "global_step": self.global_step,
+                "lr_multipliers": (
+                    self._lr_multipliers.tolist()
+                    if self._lr_multipliers is not None
+                    else [1.0, 1.0]
+                ),
+                "skipped": True,
+                "reason": "nan_loss",
             }
 
         # === CUDA Graph Path ===
@@ -1205,7 +1222,7 @@ class DeepNestedOptimizer:
                     # Update LR tensors BEFORE capture so graph uses correct values
                     if self._graph_lr_tensors is not None:
                         for i in range(len(self._graph_lr_tensors)):
-                            if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                            if len(self.base_optimizer.param_groups[i]["params"]) > 0:
                                 new_lr = self.base_lr * self._lr_multipliers[i]
                                 self._graph_lr_tensors[i].fill_(new_lr)
                     self._capture_cuda_graph()
@@ -1235,13 +1252,15 @@ class DeepNestedOptimizer:
                 # _capture_cuda_graph(), so we can return early with results
                 if capture_succeeded:
                     # Update EMA loss for the capture step
-                    self.ema_loss = (1 - self.beta_ema) * self.ema_loss + self.beta_ema * actual_loss
+                    self.ema_loss = (
+                        1 - self.beta_ema
+                    ) * self.ema_loss + self.beta_ema * actual_loss
 
                     return {
-                        'global_step': self.global_step,
-                        'lr_multipliers': self._lr_multipliers.clone(),
-                        'ema_loss': self.ema_loss.clone(),
-                        'cuda_graph_capture': True,
+                        "global_step": self.global_step,
+                        "lr_multipliers": self._lr_multipliers.clone(),
+                        "ema_loss": self.ema_loss.clone(),
+                        "cuda_graph_capture": True,
                     }
 
             # Replay phase: use captured graph
@@ -1250,7 +1269,7 @@ class DeepNestedOptimizer:
                 result = self._replay_cuda_graph(actual_loss)
 
                 # Simple mode: auto meta-update
-                if self.mode == 'simple' and self.global_step % self.meta_update_freq == 0:
+                if self.mode == "simple" and self.global_step % self.meta_update_freq == 0:
                     self._update_meta_components(actual_loss)
 
                 return result
@@ -1280,9 +1299,7 @@ class DeepNestedOptimizer:
         if self.max_grad_norm > 0:
             use_inplace = self.use_cuda_graph and self._cuda_graph_captured
             grad_norm = _fused_clip_grad_norm_(
-                self.model.parameters(),
-                self.max_grad_norm,
-                inplace=use_inplace
+                self.model.parameters(), self.max_grad_norm, inplace=use_inplace
             )
             # Check for NaN/Inf gradients after clipping
             # Use tensor comparison directly (no .item() sync!)
@@ -1290,13 +1307,19 @@ class DeepNestedOptimizer:
             if grad_is_nan:
                 # Only sync for print if we're actually logging (rare case)
                 # Note: This branch is only taken when training has diverged
-                print(f"  [NaN GUARD] step {self.global_step}: gradient norm is NaN/Inf, skipping update")
+                print(
+                    f"  [NaN GUARD] step {self.global_step}: gradient norm is NaN/Inf, skipping update"
+                )
                 self.base_optimizer.zero_grad(set_to_none=True)
                 return {
-                    'global_step': self.global_step,
-                    'lr_multipliers': self._lr_multipliers.tolist() if self._lr_multipliers is not None else [1.0, 1.0],
-                    'skipped': True,
-                    'reason': 'nan_gradient'
+                    "global_step": self.global_step,
+                    "lr_multipliers": (
+                        self._lr_multipliers.tolist()
+                        if self._lr_multipliers is not None
+                        else [1.0, 1.0]
+                    ),
+                    "skipped": True,
+                    "reason": "nan_gradient",
                 }
 
         if not self.use_cms_updates:
@@ -1305,15 +1328,15 @@ class DeepNestedOptimizer:
             if self._graph_lr_tensors is not None:
                 # CUDA Graph mode: use tensor LRs (update in-place)
                 for i in range(len(self._graph_lr_tensors)):
-                    if len(self.base_optimizer.param_groups[i]['params']) > 0:
+                    if len(self.base_optimizer.param_groups[i]["params"]) > 0:
                         new_lr = self.base_lr * self._lr_multipliers[i]
                         self._graph_lr_tensors[i].fill_(new_lr)
             else:
                 # Non-graph mode: use scalar LRs
                 effective_lrs = (self.base_lr * self._lr_multipliers).tolist()
                 for i, group in enumerate(self.base_optimizer.param_groups):
-                    if len(group['params']) > 0:
-                        group['lr'] = effective_lrs[i]
+                    if len(group["params"]) > 0:
+                        group["lr"] = effective_lrs[i]
 
             # Let AdamW handle the actual update (has adaptive per-param LR)
             self.base_optimizer.step()
@@ -1329,9 +1352,9 @@ class DeepNestedOptimizer:
             # === PHASE 1: Train DirectUpdateMLP via surrogate loss ===
             # This must happen WITH gradients before we apply updates
             should_train_mlp = (
-                self.use_preprocessing and
-                self.mlp_optimizer is not None and
-                self.global_step % self.mlp_train_freq == 0
+                self.use_preprocessing
+                and self.mlp_optimizer is not None
+                and self.global_step % self.mlp_train_freq == 0
             )
 
             if should_train_mlp:
@@ -1342,7 +1365,7 @@ class DeepNestedOptimizer:
                 max_samples = 20
 
                 for group_idx, group in enumerate(self.base_optimizer.param_groups):
-                    for param in group['params']:
+                    for param in group["params"]:
                         if param.grad is None:
                             continue
                         # Sample every 10th parameter, or all if small model
@@ -1364,7 +1387,7 @@ class DeepNestedOptimizer:
                     for param, cms in training_samples:
                         grad = param.grad.detach()  # Detach from main model graph
                         # IMPORTANT: Detach accumulated grad to prevent gradient graph leak
-                        level_grad = cms.levels[0]['accumulated_grad'].detach().clone()
+                        level_grad = cms.levels[0]["accumulated_grad"].detach().clone()
                         freq = self.cms_frequencies[0] if len(self.cms_frequencies) > 0 else 1
                         level_grad = level_grad / max(freq, 1)
                         prev_momentum = cms.get_momentum(0).detach()
@@ -1403,7 +1426,7 @@ class DeepNestedOptimizer:
                 for group_idx, group in enumerate(self.base_optimizer.param_groups):
                     lr = effective_lrs[group_idx]
 
-                    for param in group['params']:
+                    for param in group["params"]:
                         if param.grad is None:
                             continue
 
@@ -1424,7 +1447,11 @@ class DeepNestedOptimizer:
                                 prev_momentum = cms.get_momentum(level)
 
                                 # CRITICAL: Normalize by accumulation steps to get average gradient
-                                freq = self.cms_frequencies[level] if level < len(self.cms_frequencies) else 1
+                                freq = (
+                                    self.cms_frequencies[level]
+                                    if level < len(self.cms_frequencies)
+                                    else 1
+                                )
                                 level_grad = level_grad / max(freq, 1)
 
                                 # Paper-aligned: Update EMA gradient target for L2 regression
@@ -1443,13 +1470,17 @@ class DeepNestedOptimizer:
                                     # Update momentum with exponential decay + new update
                                     # This is similar to Adam's approach: track running average
                                     beta1 = 0.9  # Momentum coefficient
-                                    new_momentum = beta1 * prev_momentum + (1 - beta1) * level_update
+                                    new_momentum = (
+                                        beta1 * prev_momentum + (1 - beta1) * level_update
+                                    )
 
                                     # Soft clamp momentum at 100x gradient magnitude
                                     grad_norm = level_grad.norm().clamp(min=1e-8)
                                     momentum_norm = new_momentum.norm()
                                     if momentum_norm > 100.0 * grad_norm:
-                                        new_momentum = new_momentum * (100.0 * grad_norm / momentum_norm)
+                                        new_momentum = new_momentum * (
+                                            100.0 * grad_norm / momentum_norm
+                                        )
 
                                     cms.update_momentum(level, new_momentum)
 
@@ -1471,7 +1502,9 @@ class DeepNestedOptimizer:
                                     grad_norm = level_grad.norm().clamp(min=1e-8)
                                     momentum_norm = new_momentum.norm()
                                     if momentum_norm > 100.0 * grad_norm:
-                                        new_momentum = new_momentum * (100.0 * grad_norm / momentum_norm)
+                                        new_momentum = new_momentum * (
+                                            100.0 * grad_norm / momentum_norm
+                                        )
 
                                     cms.update_momentum(level, new_momentum)
 
@@ -1482,7 +1515,10 @@ class DeepNestedOptimizer:
                                     level_update = new_momentum * (1 - damping) * level_weight
 
                                 # NaN check
-                                if torch.isnan(level_update).any() or torch.isinf(level_update).any():
+                                if (
+                                    torch.isnan(level_update).any()
+                                    or torch.isinf(level_update).any()
+                                ):
                                     continue  # Skip this level's contribution
 
                                 total_update += level_update
@@ -1493,7 +1529,7 @@ class DeepNestedOptimizer:
                             # Use sqrt(n) normalization to prevent magnitude explosion
                             # when multiple levels fire simultaneously
                             if num_active_levels > 1:
-                                geom_factor = num_active_levels ** 0.5  # sqrt(n)
+                                geom_factor = num_active_levels**0.5  # sqrt(n)
                                 total_update = total_update / geom_factor
 
                             # Final NaN/Inf check
@@ -1508,19 +1544,36 @@ class DeepNestedOptimizer:
                             param.add_(total_update, alpha=-lr)
 
         # Simple mode: auto meta-update
-        if self.mode == 'simple' and self.global_step % self.meta_update_freq == 0:
+        if self.mode == "simple" and self.global_step % self.meta_update_freq == 0:
             self._update_meta_components(actual_loss)
+
+        # T091: CMS Level 1 - score_step at ~10 step frequency
+        # Normalize accumulators and increment block ages
+        level_1_freq = self.cms_frequencies[1] if len(self.cms_frequencies) > 1 else 10
+        if self.global_step % level_1_freq == 0:
+            for layer in self._block_sparse_layers:
+                layer.score_step()
+
+        # T092/T093: CMS Level 2 - topology_step at ~100 step frequency
+        # Make topology decisions (prune/grow blocks) with deterministic RNG
+        level_2_freq = self.cms_frequencies[2] if len(self.cms_frequencies) > 2 else 100
+        if self.global_step % level_2_freq == 0:
+            for layer in self._block_sparse_layers:
+                # T093: Pass global_step for deterministic topology decisions across DDP ranks
+                layer.topology_step(global_step=self.global_step)
+            # T072: Log topology metrics after topology step
+            self._log_topology_metrics()
 
         # Build return dict with surrogate loss info if available
         result = {
-            'global_step': self.global_step,
-            'lr_multipliers': self._lr_multipliers.clone(),
-            'ema_loss': self.ema_loss.clone(),
+            "global_step": self.global_step,
+            "lr_multipliers": self._lr_multipliers.clone(),
+            "ema_loss": self.ema_loss.clone(),
         }
 
         # Add surrogate loss if we trained the MLP this step
-        if hasattr(self, '_last_surrogate_loss'):
-            result['surrogate_loss'] = self._last_surrogate_loss
+        if hasattr(self, "_last_surrogate_loss"):
+            result["surrogate_loss"] = self._last_surrogate_loss
 
         return result
 
@@ -1539,7 +1592,7 @@ class DeepNestedOptimizer:
         self.simplified_meta_trainer.record_step(
             loss=loss_value,
             multipliers=self._lr_multipliers,
-            momentum_norm=momentum_stats.get('momentum_avg_norm', 0.0),
+            momentum_norm=momentum_stats.get("momentum_avg_norm", 0.0),
         )
 
         # Compute gradient statistics
@@ -1600,7 +1653,7 @@ class DeepNestedOptimizer:
         # Sample a subset of parameters for efficiency (max 10)
         sampled_params = []
         for group in self.param_groups:
-            for param in group['params'][:5]:  # First 5 from each group
+            for param in group["params"][:5]:  # First 5 from each group
                 if param.grad is not None:
                     sampled_params.append(param)
         sampled_params = sampled_params[:10]
@@ -1661,8 +1714,8 @@ class DeepNestedOptimizer:
 
         # Add regularization toward good defaults when loss is stagnating
         recent_improvement = (
-            self.simplified_meta_trainer.loss_history[0] -
-            self.simplified_meta_trainer.loss_history[-1]
+            self.simplified_meta_trainer.loss_history[0]
+            - self.simplified_meta_trainer.loss_history[-1]
         )
 
         if recent_improvement < 0.001:
@@ -1700,10 +1753,11 @@ class DeepNestedOptimizer:
         Note: Full unrolled mode is computationally expensive. Call sparingly.
         """
         if loss_fn is None:
+
             def loss_fn(model, batch):
                 output = model(batch)
                 if isinstance(output, dict):
-                    return output.get('loss', output.get('total', torch.tensor(0.0)))
+                    return output.get("loss", output.get("total", torch.tensor(0.0)))
                 return output
 
         if use_unrolled and train_batches is not None and len(train_batches) >= self.k_unroll:
@@ -1713,8 +1767,8 @@ class DeepNestedOptimizer:
             meta_loss = self.unrolled_meta_trainer.compute_meta_loss(
                 model=self.model,
                 optimizer_components={
-                    'momentum_mlp': self.momentum_mlp,
-                    'controller': self.controller,
+                    "momentum_mlp": self.momentum_mlp,
+                    "controller": self.controller,
                 },
                 train_batches=train_batches,
                 val_batch=val_batch,
@@ -1747,19 +1801,18 @@ class DeepNestedOptimizer:
                 torch.cuda.empty_cache()
 
             # Use smaller batch if provided batch is large (reduce memory)
-            if isinstance(val_batch, dict) and 'input_ids' in val_batch:
-                batch_size = val_batch['input_ids'].size(0)
+            if isinstance(val_batch, dict) and "input_ids" in val_batch:
+                batch_size = val_batch["input_ids"].size(0)
                 if batch_size > 4:
                     # Use only first 4 samples to reduce memory
                     val_batch = {
-                        k: v[:4] if torch.is_tensor(v) else v
-                        for k, v in val_batch.items()
+                        k: v[:4] if torch.is_tensor(v) else v for k, v in val_batch.items()
                     }
 
             val_loss = loss_fn(self.model, val_batch)
 
             # Detach to avoid any gradient accumulation from this forward pass
-            if hasattr(val_loss, 'detach'):
+            if hasattr(val_loss, "detach"):
                 val_loss_value = val_loss.detach().item()
             else:
                 val_loss_value = float(val_loss)
@@ -1807,9 +1860,9 @@ class DeepNestedOptimizer:
             count = 1
 
         return {
-            'momentum_total_norm': total_norm,
-            'momentum_avg_norm': total_norm / max(count, 1),
-            'global_step': float(self.global_step),
+            "momentum_total_norm": total_norm,
+            "momentum_avg_norm": total_norm / max(count, 1),
+            "global_step": float(self.global_step),
         }
 
     def state_dict(self) -> Dict[str, Any]:
@@ -1819,65 +1872,65 @@ class DeepNestedOptimizer:
         for i, (param, state) in enumerate(self.state.items()):
             cms_state[i] = {
                 level: {
-                    'momentum': state.levels[level]['momentum'].clone(),
-                    'step_count': state.levels[level]['step_count'],
-                    'accumulated_grad': state.levels[level]['accumulated_grad'].clone(),
+                    "momentum": state.levels[level]["momentum"].clone(),
+                    "step_count": state.levels[level]["step_count"],
+                    "accumulated_grad": state.levels[level]["accumulated_grad"].clone(),
                     # Paper-aligned additions
-                    'ema_grad': state.levels[level]['ema_grad'].clone(),
-                    'v_sq': state.levels[level]['v_sq'].clone(),
+                    "ema_grad": state.levels[level]["ema_grad"].clone(),
+                    "v_sq": state.levels[level]["v_sq"].clone(),
                 }
                 for level in state.levels
             }
 
         state = {
-            'base_optimizer': self.base_optimizer.state_dict(),
-            'momentum_mlp': self.momentum_mlp.state_dict(),
-            'controller': self.controller.state_dict(),
-            'meta_optimizer': self.meta_optimizer.state_dict(),
-            'global_step': self.global_step,
-            'lr_multipliers': self._lr_multipliers.clone(),
-            'ema_loss': self.ema_loss.clone(),
-            'cms_state': cms_state,
+            "base_optimizer": self.base_optimizer.state_dict(),
+            "momentum_mlp": self.momentum_mlp.state_dict(),
+            "controller": self.controller.state_dict(),
+            "meta_optimizer": self.meta_optimizer.state_dict(),
+            "global_step": self.global_step,
+            "lr_multipliers": self._lr_multipliers.clone(),
+            "ema_loss": self.ema_loss.clone(),
+            "cms_state": cms_state,
         }
 
         # Save MLP optimizer state if it exists (CMS mode with preprocessing)
         if self.mlp_optimizer is not None:
-            state['mlp_optimizer'] = self.mlp_optimizer.state_dict()
+            state["mlp_optimizer"] = self.mlp_optimizer.state_dict()
 
         return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load optimizer state from checkpoint."""
-        self.base_optimizer.load_state_dict(state_dict['base_optimizer'])
-        self.momentum_mlp.load_state_dict(state_dict['momentum_mlp'])
-        self.controller.load_state_dict(state_dict['controller'])
-        self.meta_optimizer.load_state_dict(state_dict['meta_optimizer'])
-        self.global_step = state_dict['global_step']
-        self._lr_multipliers = state_dict.get('lr_multipliers', torch.ones(self.n_groups))
-        self.ema_loss = state_dict.get('ema_loss', torch.zeros(self.n_groups))
+        self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
+        self.momentum_mlp.load_state_dict(state_dict["momentum_mlp"])
+        self.controller.load_state_dict(state_dict["controller"])
+        self.meta_optimizer.load_state_dict(state_dict["meta_optimizer"])
+        self.global_step = state_dict["global_step"]
+        self._lr_multipliers = state_dict.get("lr_multipliers", torch.ones(self.n_groups))
+        self.ema_loss = state_dict.get("ema_loss", torch.zeros(self.n_groups))
 
         # Restore CMS state (including paper-aligned additions)
-        if 'cms_state' in state_dict:
-            cms_state = state_dict['cms_state']
+        if "cms_state" in state_dict:
+            cms_state = state_dict["cms_state"]
             for i, (param, state) in enumerate(self.state.items()):
                 if i in cms_state:
                     for level, level_data in cms_state[i].items():
-                        state.levels[level]['momentum'] = level_data['momentum'].to(self.device)
-                        state.levels[level]['step_count'] = level_data['step_count']
-                        state.levels[level]['accumulated_grad'] = level_data['accumulated_grad'].to(self.device)
+                        state.levels[level]["momentum"] = level_data["momentum"].to(self.device)
+                        state.levels[level]["step_count"] = level_data["step_count"]
+                        state.levels[level]["accumulated_grad"] = level_data["accumulated_grad"].to(
+                            self.device
+                        )
                         # Paper-aligned additions (with backwards compatibility)
-                        state.levels[level]['ema_grad'] = level_data.get(
-                            'ema_grad',
-                            torch.zeros_like(state.levels[level]['momentum'])
+                        state.levels[level]["ema_grad"] = level_data.get(
+                            "ema_grad", torch.zeros_like(state.levels[level]["momentum"])
                         ).to(self.device)
-                        state.levels[level]['v_sq'] = level_data.get(
-                            'v_sq',
-                            torch.zeros_like(state.levels[level]['momentum'])
+                        state.levels[level]["v_sq"] = level_data.get(
+                            "v_sq", torch.zeros_like(state.levels[level]["momentum"])
                         ).to(self.device)
 
         # Restore MLP optimizer state if it exists
-        if 'mlp_optimizer' in state_dict and self.mlp_optimizer is not None:
-            self.mlp_optimizer.load_state_dict(state_dict['mlp_optimizer'])
+        if "mlp_optimizer" in state_dict and self.mlp_optimizer is not None:
+            self.mlp_optimizer.load_state_dict(state_dict["mlp_optimizer"])
 
     @property
     def param_groups(self) -> List[Dict]:
@@ -1888,3 +1941,111 @@ class DeepNestedOptimizer:
     def param_groups(self, value):
         """Set parameter groups."""
         self._param_groups = value
+
+    def discover_block_sparse_layers(self) -> List[nn.Module]:
+        """T088: Scan model for CMSBlockLinear instances.
+
+        Called during __init__ to discover and cache block-sparse layers.
+        The cached list is stored in self._block_sparse_layers.
+
+        Returns:
+            List of CMSBlockLinear modules found in the model
+        """
+        # Import here to avoid circular dependency
+        try:
+            from titans_core.layers.block_sparse import CMSBlockLinear
+        except ImportError:
+            return []
+
+        layers = []
+        for module in self.model.modules():
+            if isinstance(module, CMSBlockLinear):
+                layers.append(module)
+        return layers
+
+    @property
+    def block_sparse_layers(self) -> List[nn.Module]:
+        """T072/T089: Get all CMSBlockLinear layers in the model.
+
+        Returns cached list from init for faster access.
+
+        Returns:
+            List of CMSBlockLinear modules found in the model
+        """
+        # Return cached list if available (T089)
+        if hasattr(self, "_block_sparse_layers"):
+            return self._block_sparse_layers
+        # Fallback to discovery (for backwards compatibility)
+        return self.discover_block_sparse_layers()
+
+    def _log_topology_metrics(self) -> None:
+        """T073: Log topology metrics for all block-sparse layers.
+
+        Logs to wandb/tensorboard if available. Uses optional logging
+        to avoid crashes if logging framework is not installed.
+        """
+        layers = self.block_sparse_layers
+        if not layers:
+            return
+
+        # Collect metrics from all layers
+        metrics = {}
+        for i, layer in enumerate(layers):
+            stats = layer.get_topology_stats()
+            prefix = f"topology/layer_{i}"
+            metrics[f"{prefix}/density"] = stats.density
+            metrics[f"{prefix}/avg_block_score"] = stats.avg_block_score
+            metrics[f"{prefix}/avg_block_age"] = stats.avg_block_age
+            metrics[f"{prefix}/column_entropy"] = stats.column_entropy
+            metrics[f"{prefix}/num_blocks"] = stats.num_blocks
+            metrics[f"{prefix}/avg_swap_rate"] = layer.get_avg_swap_rate()
+
+        # Aggregate metrics across all layers
+        if layers:
+            metrics["topology/mean_density"] = sum(
+                layer.get_topology_stats().density for layer in layers
+            ) / len(layers)
+            metrics["topology/mean_entropy"] = sum(
+                layer.get_topology_stats().column_entropy for layer in layers
+            ) / len(layers)
+            metrics["topology/mean_swap_rate"] = sum(
+                layer.get_avg_swap_rate() for layer in layers
+            ) / len(layers)
+
+        # Try to log to wandb (optional)
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log(metrics, step=self.global_step)
+        except ImportError:
+            pass
+        except Exception:
+            pass  # Ignore any wandb errors
+
+        # Try to log to tensorboard via torch.utils.tensorboard (optional)
+        try:
+            if hasattr(self, "_tb_writer") and self._tb_writer is not None:
+                for key, value in metrics.items():
+                    self._tb_writer.add_scalar(key, value, self.global_step)
+        except Exception:
+            pass  # Ignore any tensorboard errors
+
+    def set_tensorboard_writer(self, writer) -> None:
+        """Set tensorboard SummaryWriter for topology logging.
+
+        Args:
+            writer: torch.utils.tensorboard.SummaryWriter instance
+        """
+        self._tb_writer = writer
+
+    def get_avg_swap_rate(self) -> float:
+        """T074: Get average swap rate across all block-sparse layers.
+
+        Returns:
+            Mean swap rate across all layers, or 0.0 if no layers
+        """
+        layers = self.block_sparse_layers
+        if not layers:
+            return 0.0
+        return sum(layer.get_avg_swap_rate() for layer in layers) / len(layers)

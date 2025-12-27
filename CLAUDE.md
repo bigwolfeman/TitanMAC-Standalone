@@ -58,10 +58,17 @@ titans_core/
 ├── memory/
 │   ├── neural_memory.py        # Gradient-based memory with forget/decay gates
 │   └── memory_bank.py          # Key-value retrieval for MAC
+├── layers/
+│   ├── block_sparse.py         # CMSBlockLinear - dynamic block-sparse linear
+│   └── block_ell.py            # Block-ELL tensor format utilities
+├── kernels/
+│   ├── block_ell_forward.py    # Triton forward kernel for block-sparse
+│   └── block_ell_backward.py   # Triton backward kernel for block-sparse
 └── opt/                         # Nested Learning optimizers
     ├── deep_nested_optimizer.py # Main optimizer (recommended)
     ├── dmgd.py                  # Deep Momentum Gradient Descent
     ├── cms.py                   # Continuum Memory System
+    ├── topology_scorer.py       # Block importance scoring for CMS
     ├── nested_controller.py     # LR multiplier network
     └── param_groups.py          # Parameter grouping utilities
 ```
@@ -117,13 +124,40 @@ Meta-learning backward can conflict with optimizer.step(). Key functions must:
 - Return `stats.detach()` from `_compute_group_stats()`
 - Detach `grad`, `prev_momentum`, `ema_target` in `_compute_mlp_proxy_loss()`
 
+### Block-Sparse Training Pattern (CMS)
+CMSBlockLinear uses a multi-frequency update schedule:
+```python
+for step, batch in enumerate(dataloader):
+    loss.backward()
+
+    # Every step: accumulate gradient scores
+    layer.accumulate_scores()
+
+    optimizer.step()
+
+    # Every 10 steps: normalize scores, increment block ages
+    if step % 10 == 0:
+        layer.score_step()
+
+    # Every 100 steps: topology decisions (prune/grow blocks)
+    if step % 100 == 0:
+        result = layer.topology_step(global_step=step)
+```
+
+Key constraints:
+- Dimensions must be divisible by tile_size (16 recommended)
+- Use `global_step` for deterministic topology in DDP
+- Don't use `fullgraph=True` with torch.compile
+
 ## Documentation
 
 Key docs in `/docs`:
+- `block_sparse_quickstart.md` - CMSBlockLinear usage and troubleshooting
 - `OPTIMIZER_QUICK_REFERENCE.md` - DeepNestedOptimizer API and troubleshooting
 - `PERFORMANCE_OPTIMIZATIONS.md` - Fused operations, CUDA graphs, torch.compile
 - `GPU_PROFILING_REPORT.md` - Profiling analysis and bottlenecks
 - `PAPER_FAITHFUL_REFACTOR.md` - Memory architecture alignment with papers
+- `cms_block_sparse_spec.md` - Full CMS block-sparse design specification
 
 ## Variants
 

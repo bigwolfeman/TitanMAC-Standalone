@@ -48,7 +48,7 @@ class TitanMACForDistillation(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        **kwargs  # Ignore other HuggingFace trainer kwargs
+        **kwargs,  # Ignore other HuggingFace trainer kwargs
     ) -> CausalLMOutput:
         """
         Forward pass with HuggingFace-compatible output.
@@ -72,11 +72,7 @@ class TitanMACForDistillation(nn.Module):
             individual loss components: result["ce_loss"], result["memory_loss"]
         """
         # Call underlying TitanMAC model
-        result = self.model(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=attention_mask
-        )
+        result = self.model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
 
         # Convert to CausalLMOutput
         # Note: result["loss"] already includes memory_loss if enabled

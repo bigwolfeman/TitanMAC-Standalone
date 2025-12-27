@@ -148,15 +148,15 @@ def group_moe_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Para
         is_embed_param = False
 
         # Token embeddings always go to embed group
-        if 'token_embedding' in name:
+        if "token_embedding" in name:
             is_embed_param = True
 
         # Norms (RMSNorm, LayerNorm, etc.) go to embed group
-        elif 'norm' in name.lower():
+        elif "norm" in name.lower():
             is_embed_param = True
 
         # Router/gate weights go to embed group
-        elif 'router' in name or 'gate' in name:
+        elif "router" in name or "gate" in name:
             is_embed_param = True
 
         # 1D parameters (biases, etc.) go to embed group

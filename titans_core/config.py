@@ -6,8 +6,8 @@ nested optimizer integration. Supports full Titans paper (arxiv 2501.00663)
 and Nested Learning (NeurIPS 2025) features.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 
 # Valid Titans architecture variants
@@ -157,6 +157,19 @@ class TitanMACConfig:
     use_cms: bool = False  # Enable multi-frequency parameter updates
     cms_frequencies: Optional[Dict[int, int]] = None  # Per-group update frequencies
 
+    # =========================================================================
+    # MLP Block-Sparse Configuration (CMS Block-Sparse Linear Layers)
+    # =========================================================================
+    mlp_use_block_sparse: bool = False  # Whether MLP layers should use CMSBlockLinear
+    mlp_block_sparse_tile_size: int = 16  # Tile size for block-sparse (8, 16, or 32)
+    mlp_block_sparse_density: Union[float, Dict[int, float]] = (
+        0.5  # Default density or per-layer dict
+    )
+    mlp_block_sparse_layers: Optional[Tuple[int, ...]] = (
+        None  # Which layer indices use sparse (None = all)
+    )
+    mlp_block_sparse_components: Tuple[str, ...] = ("mlp",)  # Which components ('mlp', 'attention')
+
     @property
     def d_head(self) -> int:
         """Compute head dimension from d_model and n_heads."""
@@ -254,20 +267,17 @@ class TitanMACConfig:
             raise ValueError(f"memory_eta_lr must be positive, got {self.memory_eta_lr}")
 
         if not 0.0 < self.memory_rank_ratio <= 1.0:
-            raise ValueError(
-                f"memory_rank_ratio must be in (0, 1], got {self.memory_rank_ratio}"
-            )
+            raise ValueError(f"memory_rank_ratio must be in (0, 1], got {self.memory_rank_ratio}")
 
         # =====================================================================
         # Validate Titans Neural Memory parameters
         # =====================================================================
         if self.use_neural_memory:
             if self.n_memory_layers < 1:
-                raise ValueError(
-                    f"n_memory_layers must be >= 1, got {self.n_memory_layers}"
-                )
+                raise ValueError(f"n_memory_layers must be >= 1, got {self.n_memory_layers}")
             if self.n_memory_layers < 2:
                 import warnings
+
                 warnings.warn(
                     "Paper recommends n_memory_layers >= 2 for better expressivity. "
                     f"Got {self.n_memory_layers}."
@@ -275,9 +285,7 @@ class TitanMACConfig:
             if self.d_memory is not None and self.d_memory <= 0:
                 raise ValueError(f"d_memory must be positive, got {self.d_memory}")
             if self.memory_theta_lr <= 0:
-                raise ValueError(
-                    f"memory_theta_lr must be positive, got {self.memory_theta_lr}"
-                )
+                raise ValueError(f"memory_theta_lr must be positive, got {self.memory_theta_lr}")
             if self.memory_forget_hidden <= 0:
                 raise ValueError(
                     f"memory_forget_hidden must be positive, got {self.memory_forget_hidden}"
@@ -300,13 +308,9 @@ class TitanMACConfig:
         # =====================================================================
         if self.use_dmgd:
             if self.dmgd_hidden_dim <= 0:
-                raise ValueError(
-                    f"dmgd_hidden_dim must be positive, got {self.dmgd_hidden_dim}"
-                )
+                raise ValueError(f"dmgd_hidden_dim must be positive, got {self.dmgd_hidden_dim}")
             if self.dmgd_n_groups <= 0:
-                raise ValueError(
-                    f"dmgd_n_groups must be positive, got {self.dmgd_n_groups}"
-                )
+                raise ValueError(f"dmgd_n_groups must be positive, got {self.dmgd_n_groups}")
 
         # =====================================================================
         # Validate CMS parameters
@@ -323,6 +327,66 @@ class TitanMACConfig:
                             f"CMS frequency must be positive int, got {freq} for group {group_idx}"
                         )
 
+        # =====================================================================
+        # Validate MLP Block-Sparse parameters
+        # =====================================================================
+        if self.mlp_use_block_sparse:
+            # Validate tile size
+            valid_tile_sizes = {8, 16, 32}
+            if self.mlp_block_sparse_tile_size not in valid_tile_sizes:
+                raise ValueError(
+                    f"mlp_block_sparse_tile_size must be one of {valid_tile_sizes}, "
+                    f"got {self.mlp_block_sparse_tile_size}"
+                )
+
+            # Validate density (can be float or dict)
+            if isinstance(self.mlp_block_sparse_density, dict):
+                for layer_idx, density in self.mlp_block_sparse_density.items():
+                    if not isinstance(layer_idx, int) or layer_idx < 0:
+                        raise ValueError(
+                            f"mlp_block_sparse_density layer index must be non-negative int, "
+                            f"got {layer_idx}"
+                        )
+                    if not (0.1 <= density <= 1.0):
+                        raise ValueError(
+                            f"mlp_block_sparse_density for layer {layer_idx} must be in [0.1, 1.0], "
+                            f"got {density}"
+                        )
+            else:
+                # Single float value
+                if not (0.1 <= self.mlp_block_sparse_density <= 1.0):
+                    raise ValueError(
+                        f"mlp_block_sparse_density must be in [0.1, 1.0], "
+                        f"got {self.mlp_block_sparse_density}"
+                    )
+
+            # Validate layers tuple if provided
+            if self.mlp_block_sparse_layers is not None:
+                if not isinstance(self.mlp_block_sparse_layers, tuple):
+                    raise ValueError(
+                        f"mlp_block_sparse_layers must be a tuple, "
+                        f"got {type(self.mlp_block_sparse_layers).__name__}"
+                    )
+                for layer_idx in self.mlp_block_sparse_layers:
+                    if not isinstance(layer_idx, int) or layer_idx < 0:
+                        raise ValueError(
+                            f"mlp_block_sparse_layers must contain non-negative ints, "
+                            f"got {layer_idx}"
+                        )
+                    if layer_idx >= self.n_layers:
+                        raise ValueError(
+                            f"mlp_block_sparse_layers index {layer_idx} exceeds n_layers ({self.n_layers})"
+                        )
+
+            # Validate components tuple
+            valid_components = {"mlp", "attention"}
+            for component in self.mlp_block_sparse_components:
+                if component not in valid_components:
+                    raise ValueError(
+                        f"mlp_block_sparse_components must only contain {valid_components}, "
+                        f"got '{component}'"
+                    )
+
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert config to dictionary.
@@ -336,10 +400,7 @@ class TitanMACConfig:
             >>> isinstance(config_dict, dict)
             True
         """
-        return {
-            field_name: getattr(self, field_name)
-            for field_name in self.__dataclass_fields__
-        }
+        return {field_name: getattr(self, field_name) for field_name in self.__dataclass_fields__}
 
     def __repr__(self) -> str:
         """Custom repr showing key parameters."""

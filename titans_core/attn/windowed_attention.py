@@ -26,6 +26,7 @@ class WindowConfig:
         dropout: Dropout probability
         causal: Apply causal masking (default: True)
     """
+
     window_size: int
     num_heads: int
     head_dim: int
@@ -35,9 +36,7 @@ class WindowConfig:
 
 
 def enable_sdpa_backends(
-    mem_efficient: bool = True,
-    math: bool = True,
-    flash: bool = False
+    mem_efficient: bool = True, math: bool = True, flash: bool = False
 ) -> None:
     """
     Configure PyTorch SDPA backends for compatibility.
@@ -63,8 +62,8 @@ def build_band_mask(
     seq_len: int,
     window_size: int,
     num_persistent_tokens: int,
-    device: str = 'cuda',
-    causal: bool = True
+    device: str = "cuda",
+    causal: bool = True,
 ) -> torch.Tensor:
     """
     Build band attention mask for window attention with persistent tokens.
@@ -147,14 +146,15 @@ def build_band_mask(
 
         # Apply causal constraint to sequence tokens
         # (persistent tokens remain bidirectional)
-        mask[seq_start:, seq_start:] = mask[seq_start:, seq_start:] & causal_mask[seq_start:, seq_start:]
+        mask[seq_start:, seq_start:] = (
+            mask[seq_start:, seq_start:] & causal_mask[seq_start:, seq_start:]
+        )
 
     return mask
 
 
 def convert_mask_to_sdpa_format(
-    mask: torch.Tensor,
-    dtype: torch.dtype = torch.float32
+    mask: torch.Tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """
     Convert boolean mask to SDPA additive mask format.
@@ -172,7 +172,7 @@ def convert_mask_to_sdpa_format(
     """
     # SDPA format: 0.0 for allowed, -inf for masked
     sdpa_mask = torch.zeros_like(mask, dtype=dtype)
-    sdpa_mask = sdpa_mask.masked_fill(~mask, float('-inf'))
+    sdpa_mask = sdpa_mask.masked_fill(~mask, float("-inf"))
     return sdpa_mask
 
 
@@ -206,7 +206,7 @@ class WindowedAttention(nn.Module):
         super().__init__()
 
         # Handle both WindowConfig and TitanMACConfig
-        if hasattr(config, 'num_heads'):
+        if hasattr(config, "num_heads"):
             # WindowConfig
             self.d_model = config.num_heads * config.head_dim
             self.n_heads = config.num_heads
@@ -226,8 +226,9 @@ class WindowedAttention(nn.Module):
             self.dropout_p = config.attention_dropout
 
         # Validate dimensions
-        assert self.d_model == self.n_heads * self.d_head, \
-            f"d_model ({self.d_model}) must equal n_heads ({self.n_heads}) * d_head ({self.d_head})"
+        assert (
+            self.d_model == self.n_heads * self.d_head
+        ), f"d_model ({self.d_model}) must equal n_heads ({self.n_heads}) * d_head ({self.d_head})"
 
         # Q/K/V projections
         self.qkv_proj = nn.Linear(self.d_model, 3 * self.d_model, bias=False)
@@ -241,11 +242,7 @@ class WindowedAttention(nn.Module):
         # Cache for attention mask
         self._mask_cache = {}
 
-    def _get_attention_mask(
-        self,
-        seq_len: int,
-        device: torch.device
-    ) -> torch.Tensor:
+    def _get_attention_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
         Get or create attention mask for given sequence length.
 
@@ -267,18 +264,14 @@ class WindowedAttention(nn.Module):
                 window_size=self.window_size,
                 num_persistent_tokens=self.num_persistent,
                 device=str(device),
-                causal=self.causal
+                causal=self.causal,
             )
 
             self._mask_cache[cache_key] = mask
 
         return self._mask_cache[cache_key]
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass through windowed attention.
 
@@ -310,16 +303,18 @@ class WindowedAttention(nn.Module):
         # Convert boolean mask to additive mask for SDPA
         if attn_mask.dtype == torch.bool:
             sdpa_mask = torch.zeros_like(attn_mask, dtype=x.dtype)
-            sdpa_mask.masked_fill_(~attn_mask, float('-inf'))
+            sdpa_mask.masked_fill_(~attn_mask, float("-inf"))
         else:
             sdpa_mask = attn_mask
 
         # Apply SDPA
         attn_output = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=sdpa_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False  # We provide explicit mask
+            is_causal=False,  # We provide explicit mask
         )
         # attn_output: [B, n_heads, T, d_head]
 

@@ -114,11 +114,9 @@ class TopologyScorer:
 
         Returns:
             Updated EMA tensor [R, K]
-
-        Raises:
-            NotImplementedError: Skeleton - not yet implemented
         """
-        raise NotImplementedError("update_gradient_ema not yet implemented")
+        # EMA formula: new_ema = alpha * grad_norms + (1 - alpha) * current_ema
+        return self.ema_alpha * grad_norms + (1.0 - self.ema_alpha) * current_ema
 
     def compute_candidate_scores(
         self,
@@ -137,11 +135,10 @@ class TopologyScorer:
 
         Returns:
             Candidate score matrix [R, C]
-
-        Raises:
-            NotImplementedError: Skeleton - not yet implemented
         """
-        raise NotImplementedError("compute_candidate_scores not yet implemented")
+        # Outer product: [R] x [C] -> [R, C]
+        # error_norms[:, None] is [R, 1], activation_norms[None, :] is [1, C]
+        return torch.outer(error_norms, activation_norms)
 
     def select_top_k(
         self,
@@ -156,7 +153,8 @@ class TopologyScorer:
         1. Get scores for current blocks from current_scores
         2. Get scores for candidate positions from candidate_scores
         3. With probability epsilon, add random noise for exploration
-        4. Select top-K scoring positions
+        4. Apply swap_threshold: only swap if candidate is 1.5x better
+        5. Select top-K scoring positions
 
         Args:
             current_scores: Gradient EMA for current blocks [R, K]
@@ -169,11 +167,71 @@ class TopologyScorer:
             - new_col_indices: Updated column indices [R, K]
             - pruned_positions: List of (row, slot) that were pruned
             - grown_columns: List of new column indices added
-
-        Raises:
-            NotImplementedError: Skeleton - not yet implemented
         """
-        raise NotImplementedError("select_top_k not yet implemented")
+        R, K = current_scores.shape
+        C = candidate_scores.shape[1]
+        device = current_scores.device
+        dtype = current_scores.dtype
+
+        pruned_positions: List[Tuple[int, int]] = []
+        grown_columns: List[int] = []
+
+        # Create mask for active columns per row [R, C]
+        active_mask = torch.zeros((R, C), dtype=torch.bool, device=device)
+        active_mask.scatter_(1, col_indices, True)
+
+        # Apply swap threshold: boost current block scores by swap_threshold factor
+        # This makes it harder for candidates to beat them (candidate must be 1.5x better)
+        boosted_current = current_scores * self.swap_threshold
+
+        # Build combined score matrix [R, C]:
+        # - Active positions: use boosted current_scores
+        # - Inactive positions: use candidate_scores
+        combined_scores = torch.full((R, C), float("-inf"), device=device, dtype=dtype)
+        combined_scores.scatter_(1, col_indices, boosted_current)
+        combined_scores = torch.where(active_mask, combined_scores, candidate_scores)
+
+        # Epsilon-greedy exploration: with probability epsilon, add random noise
+        if self.exploration_epsilon > 0:
+            # Generate random mask for which positions get exploration noise
+            explore_mask = (
+                torch.rand((R, C), device=device, generator=generator) < self.exploration_epsilon
+            )
+
+            # Add large random noise to selected positions to potentially force selection
+            # The noise should be large enough to override normal scoring
+            max_score = (
+                combined_scores[combined_scores != float("-inf")].max().item()
+                if (combined_scores != float("-inf")).any()
+                else 1.0
+            )
+            noise = torch.rand((R, C), device=device, generator=generator) * max_score * 2
+
+            # Only apply noise to inactive positions (exploring new blocks, not keeping bad old ones)
+            explore_mask = explore_mask & ~active_mask
+            combined_scores = torch.where(explore_mask, noise, combined_scores)
+
+        # Select top-K per row
+        _, new_col_indices = torch.topk(combined_scores, K, dim=1, sorted=True)
+        new_col_indices = new_col_indices.sort(dim=1).values  # Keep sorted for consistency
+
+        # Determine which positions were pruned and which were grown
+        # Convert to sets for comparison
+        for r in range(R):
+            old_cols = set(col_indices[r].tolist())
+            new_cols = set(new_col_indices[r].tolist())
+
+            # Pruned: was in old, not in new
+            for old_slot, old_col in enumerate(col_indices[r].tolist()):
+                if old_col not in new_cols:
+                    pruned_positions.append((r, old_slot))
+
+            # Grown: in new, not in old
+            for new_col in new_cols:
+                if new_col not in old_cols:
+                    grown_columns.append(new_col)
+
+        return new_col_indices, pruned_positions, grown_columns
 
     def compute_column_entropy(self, col_indices: Tensor) -> float:
         """Compute normalized entropy of column usage across all rows.
@@ -186,11 +244,37 @@ class TopologyScorer:
 
         Returns:
             Normalized entropy in [0, 1]
-
-        Raises:
-            NotImplementedError: Skeleton - not yet implemented
         """
-        raise NotImplementedError("compute_column_entropy not yet implemented")
+        # Count usage frequency of each column
+        # col_indices is [R, K], we want to count how often each column index appears
+        flat_indices = col_indices.flatten()  # [R * K]
+
+        # Use bincount to count occurrences, with minlength=C
+        counts = torch.bincount(flat_indices.to(torch.int64), minlength=self.C)  # [C]
+
+        # Convert to probabilities (exclude zero counts from entropy calculation)
+        total = counts.sum().float()
+        if total == 0:
+            return 0.0
+
+        # Filter out zero counts to avoid log(0)
+        nonzero_mask = counts > 0
+        nonzero_counts = counts[nonzero_mask].float()
+
+        # Compute probabilities
+        probs = nonzero_counts / total
+
+        # Compute entropy: -sum(p * log(p))
+        entropy = -torch.sum(probs * torch.log(probs))
+
+        # Normalize by max entropy (log(C)) to get value in [0, 1]
+        if self.C <= 1:
+            return 1.0  # Edge case: only one column means max entropy
+
+        max_entropy = torch.log(torch.tensor(float(self.C), device=col_indices.device))
+        normalized_entropy = (entropy / max_entropy).item()
+
+        return normalized_entropy
 
     def should_swap(
         self,
@@ -201,36 +285,38 @@ class TopologyScorer:
         """Determine if a swap should occur based on scores and age.
 
         A swap occurs if:
-        - candidate_score > current_score * swap_threshold, OR
-        - block_age > age_threshold (stale blocks get replaced)
+        - candidate_score > current_score * swap_threshold
+
+        Note: block_age parameter is reserved for future use (age-based protection)
+        but is currently ignored per task specification.
 
         Args:
             current_score: Score of current block
             candidate_score: Score of candidate position
-            block_age: Age of current block in topology steps
+            block_age: Age of current block in topology steps (reserved for future)
 
         Returns:
             True if swap should occur
-
-        Raises:
-            NotImplementedError: Skeleton - not yet implemented
         """
-        raise NotImplementedError("should_swap not yet implemented")
+        # Simple threshold check: candidate must be swap_threshold times better
+        return candidate_score > current_score * self.swap_threshold
 
 
 def compute_gradient_frobenius_norms(grad: Tensor) -> Tensor:
     """Compute Frobenius norm of gradients per block.
+
+    Frobenius norm = sqrt(sum of squared elements) per block.
 
     Args:
         grad: Gradient tensor [R, K, B, B]
 
     Returns:
         Frobenius norms [R, K]
-
-    Raises:
-        NotImplementedError: Skeleton - not yet implemented
     """
-    raise NotImplementedError("compute_gradient_frobenius_norms not yet implemented")
+    # Frobenius norm: sqrt(sum of squared elements) per block
+    # grad shape is [R, K, B, B], we want output [R, K]
+    # Sum over the last two dimensions (B, B), then sqrt
+    return torch.sqrt(torch.sum(grad * grad, dim=(-2, -1)))
 
 
 def initialize_scores(
@@ -242,14 +328,27 @@ def initialize_scores(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Initialize scoring tensors for a new layer.
 
+    Args:
+        R: Number of output block-rows
+        C: Number of input block-columns
+        K: Active blocks per row
+        device: Target device for tensors
+        dtype: Data type for float tensors (block_age is always int32)
+
     Returns:
         Tuple of:
         - block_score_ema: [R, K] initialized to zeros
         - activation_norm_acc: [C] initialized to zeros
         - error_norm_acc: [R] initialized to zeros
         - block_age: [R, K] initialized to zeros (int32)
-
-    Raises:
-        NotImplementedError: Skeleton - not yet implemented
     """
-    raise NotImplementedError("initialize_scores not yet implemented")
+    # Use defaults if not specified
+    if dtype is None:
+        dtype = torch.float32
+
+    block_score_ema = torch.zeros(R, K, device=device, dtype=dtype)
+    activation_norm_acc = torch.zeros(C, device=device, dtype=dtype)
+    error_norm_acc = torch.zeros(R, device=device, dtype=dtype)
+    block_age = torch.zeros(R, K, device=device, dtype=torch.int32)
+
+    return block_score_ema, activation_norm_acc, error_norm_acc, block_age

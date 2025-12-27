@@ -177,9 +177,9 @@ class DMGDOptimizer:
         self.hidden_dim = hidden_dim
 
         # Create one MomentumMLP per group
-        self.momentum_mlps = nn.ModuleList([
-            MomentumMLP(hidden_dim=hidden_dim) for _ in range(n_groups)
-        ])
+        self.momentum_mlps = nn.ModuleList(
+            [MomentumMLP(hidden_dim=hidden_dim) for _ in range(n_groups)]
+        )
 
         # Initialize momentum buffers (zeros)
         self.v_buffers: List[Tensor] = []

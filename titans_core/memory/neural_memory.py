@@ -17,8 +17,7 @@ Where M_t refers to ALL MLP WEIGHTS at time t.
 Version: 2.0.0 (Paper-Faithful)
 """
 
-import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch._dynamo
@@ -181,7 +180,7 @@ class DeepMemoryMLP(nn.Module):
         offset = 0
         for param in self.mlp.parameters():
             numel = param.numel()
-            param.data.copy_(flat_params[offset:offset + numel].view(param.shape))
+            param.data.copy_(flat_params[offset : offset + numel].view(param.shape))
             offset += numel
 
 
@@ -291,7 +290,7 @@ class NeuralMemory(nn.Module):
         """
         for (offset, shape), param in zip(self._param_offsets, self.memory_mlp.parameters()):
             numel = param.numel()
-            self._flat_param_cache[offset:offset + numel] = param.view(-1)
+            self._flat_param_cache[offset : offset + numel] = param.view(-1)
 
     def _set_params_from_cache(self):
         """
@@ -301,7 +300,7 @@ class NeuralMemory(nn.Module):
         """
         for (offset, shape), param in zip(self._param_offsets, self.memory_mlp.parameters()):
             numel = param.numel()
-            param.data.copy_(self._flat_param_cache[offset:offset + numel].view(shape))
+            param.data.copy_(self._flat_param_cache[offset : offset + numel].view(shape))
 
     def compute_loss(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -386,7 +385,7 @@ class NeuralMemory(nn.Module):
         # PERF: Flatten gradients into pre-allocated cache (no torch.cat allocation)
         for (offset, shape), g in zip(self._param_offsets, grads):
             numel = g.numel()
-            self._flat_grad_cache[offset:offset + numel] = g.view(-1)
+            self._flat_grad_cache[offset : offset + numel] = g.view(-1)
 
         # Clip gradients for stability (in-place)
         grad_norm = self._flat_grad_cache.norm()
@@ -402,7 +401,7 @@ class NeuralMemory(nn.Module):
                     "loss": loss,
                     "alpha_t": 0.0,
                     "eta_t": 0.0,
-                    "grad_norm": float('nan'),
+                    "grad_norm": float("nan"),
                     "grad_clipped": False,
                     "skipped": True,
                 }
@@ -438,7 +437,11 @@ class NeuralMemory(nn.Module):
         self._last_update_stats_tensors = {
             "alpha_t": alpha_t.detach(),
             "eta_t": eta_t.detach(),
-            "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm),
+            "grad_norm": (
+                grad_norm.detach()
+                if isinstance(grad_norm, torch.Tensor)
+                else torch.tensor(grad_norm)
+            ),
             "grad_clipped": grad_clipped,
             "skipped": False,
         }
@@ -524,11 +527,26 @@ class NeuralMemory(nn.Module):
 
         # Include last update stats if available (saturation monitoring)
         # Convert tensor stats to Python floats only when logging
-        if hasattr(self, '_last_update_stats_tensors') and self._last_update_stats_tensors is not None:
+        if (
+            hasattr(self, "_last_update_stats_tensors")
+            and self._last_update_stats_tensors is not None
+        ):
             tensor_stats = self._last_update_stats_tensors
-            stats["alpha_t"] = tensor_stats["alpha_t"].item() if isinstance(tensor_stats["alpha_t"], torch.Tensor) else tensor_stats["alpha_t"]
-            stats["eta_t"] = tensor_stats["eta_t"].item() if isinstance(tensor_stats["eta_t"], torch.Tensor) else tensor_stats["eta_t"]
-            stats["grad_norm"] = tensor_stats["grad_norm"].item() if isinstance(tensor_stats["grad_norm"], torch.Tensor) else tensor_stats["grad_norm"]
+            stats["alpha_t"] = (
+                tensor_stats["alpha_t"].item()
+                if isinstance(tensor_stats["alpha_t"], torch.Tensor)
+                else tensor_stats["alpha_t"]
+            )
+            stats["eta_t"] = (
+                tensor_stats["eta_t"].item()
+                if isinstance(tensor_stats["eta_t"], torch.Tensor)
+                else tensor_stats["eta_t"]
+            )
+            stats["grad_norm"] = (
+                tensor_stats["grad_norm"].item()
+                if isinstance(tensor_stats["grad_norm"], torch.Tensor)
+                else tensor_stats["grad_norm"]
+            )
             stats["grad_clipped"] = tensor_stats["grad_clipped"]
             stats["skipped"] = tensor_stats["skipped"]
 

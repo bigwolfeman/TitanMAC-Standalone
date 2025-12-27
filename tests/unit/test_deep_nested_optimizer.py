@@ -296,6 +296,172 @@ class TestUnrolledMetaTrainer:
         assert trainer.use_checkpointing is True
 
 
+class BlockSparseModel(nn.Module):
+    """Model with CMSBlockLinear layer for testing block-sparse integration."""
+
+    def __init__(self, input_dim=64, hidden_dim=128, output_dim=32):
+        super().__init__()
+        # Import CMSBlockLinear
+        from titans_core.layers.block_sparse import CMSBlockLinear
+
+        # Use tile_size=16 (minimum for WMMA) and ensure divisibility
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        # CMSBlockLinear requires dimensions divisible by tile_size
+        self.block_sparse = CMSBlockLinear(
+            in_features=hidden_dim,
+            out_features=hidden_dim,
+            tile_size=16,
+            density=0.5,
+        )
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.block_sparse(x))
+        return {'loss': self.fc2(x).sum(), 'logits': self.fc2(x)}
+
+
+class TestBlockSparseIntegration:
+    """Tests for block-sparse layer integration with DeepNestedOptimizer."""
+
+    @pytest.fixture
+    def block_sparse_model(self):
+        """Create model with CMSBlockLinear layer."""
+        return BlockSparseModel()
+
+    @pytest.fixture
+    def optimizer_with_block_sparse(self, block_sparse_model):
+        """Create optimizer with block-sparse model."""
+        return DeepNestedOptimizer(
+            model=block_sparse_model,
+            base_lr=1e-3,
+            mode='simple',
+            meta_update_freq=10,
+            cms_frequencies=[1, 10, 100],  # Level 0, 1, 2 frequencies
+        )
+
+    def test_block_sparse_layer_discovery(self, block_sparse_model, optimizer_with_block_sparse):
+        """T094: Test that optimizer discovers CMSBlockLinear layers."""
+        optimizer = optimizer_with_block_sparse
+
+        # Check that the optimizer found the block-sparse layer
+        layers = optimizer.block_sparse_layers
+        assert len(layers) == 1, f"Expected 1 block-sparse layer, found {len(layers)}"
+
+        # Verify it's the correct type
+        from titans_core.layers.block_sparse import CMSBlockLinear
+        assert isinstance(layers[0], CMSBlockLinear)
+
+        # Verify discover_block_sparse_layers also works
+        discovered = optimizer.discover_block_sparse_layers()
+        assert len(discovered) == 1
+        assert discovered[0] is layers[0]
+
+    def test_block_sparse_layer_discovery_no_layers(self):
+        """T094: Test optimizer handles models without block-sparse layers."""
+        model = SimpleModel()
+        optimizer = DeepNestedOptimizer(
+            model=model,
+            base_lr=1e-3,
+            mode='simple',
+        )
+
+        layers = optimizer.block_sparse_layers
+        assert len(layers) == 0, "Should find no block-sparse layers in SimpleModel"
+
+    def test_optimizer_triggers_topology_step(self, block_sparse_model, optimizer_with_block_sparse):
+        """T095: Test that topology_step is called at appropriate frequency."""
+        optimizer = optimizer_with_block_sparse
+        model = block_sparse_model
+
+        # Get the block-sparse layer
+        layer = optimizer.block_sparse_layers[0]
+
+        # Record initial topology checksum
+        initial_checksum = layer.get_topology_checksum()
+
+        # Track topology step calls by checking swap rate history length
+        initial_history_len = len(layer._swap_rate_history)
+
+        # Run 100 steps (should trigger Level 2 topology_step at step 100)
+        x = torch.randn(4, 64)
+        for step in range(100):
+            optimizer.zero_grad()
+            output = model(x)
+            output['loss'].backward()
+            optimizer.step(output['loss'].item())
+
+        # Verify topology_step was called (swap rate history should have grown)
+        # At Level 2 freq=100, topology_step should be called once at step 100
+        final_history_len = len(layer._swap_rate_history)
+        assert final_history_len > initial_history_len, (
+            f"topology_step should have been called. History length: {initial_history_len} -> {final_history_len}"
+        )
+
+        # Verify score_step was called multiple times (Level 1 freq=10)
+        # Block age should have been incremented during score_step calls
+        avg_age = layer.block_age.float().mean().item()
+        assert avg_age > 0, "Block ages should have been incremented by score_step"
+
+    def test_score_accumulation_in_step(self, block_sparse_model, optimizer_with_block_sparse):
+        """T090: Test that accumulate_scores is called during step."""
+        optimizer = optimizer_with_block_sparse
+        model = block_sparse_model
+        layer = optimizer.block_sparse_layers[0]
+
+        # Initial score EMA should be zero
+        initial_score = layer.block_score_ema.sum().item()
+        assert initial_score == 0.0, "Initial score EMA should be zero"
+
+        # Run a few steps
+        x = torch.randn(4, 64)
+        for _ in range(5):
+            optimizer.zero_grad()
+            output = model(x)
+            output['loss'].backward()
+            optimizer.step(output['loss'].item())
+
+        # Score EMA should have been updated (accumulated)
+        final_score = layer.block_score_ema.sum().item()
+        # Note: After 5 steps, if no score_step was called yet, scores should be accumulated
+        # score_step resets scores at Level 1 frequency (10), so at step 5 we should have accumulated
+        # Since we're before step 10, the EMA should have been updated by accumulate_scores
+        assert layer._acc_steps > 0, "Accumulator steps should be > 0"
+
+    def test_deterministic_topology_with_global_step(self, block_sparse_model):
+        """T093: Test that topology decisions are deterministic with global_step."""
+        from titans_core.layers.block_sparse import CMSBlockLinear
+
+        # Create two identical layers
+        layer1 = CMSBlockLinear(
+            in_features=128, out_features=128, tile_size=16, density=0.5
+        )
+        layer2 = CMSBlockLinear(
+            in_features=128, out_features=128, tile_size=16, density=0.5
+        )
+
+        # Copy topology to make them identical
+        layer2.col_indices.copy_(layer1.col_indices)
+        layer2.values.data.copy_(layer1.values.data)
+
+        # Run topology_step with same global_step
+        global_step = 100
+        result1 = layer1.topology_step(global_step=global_step)
+        result2 = layer2.topology_step(global_step=global_step)
+
+        # Swap rates should be identical (same RNG seed)
+        assert result1.swap_rate == result2.swap_rate, (
+            f"Swap rates differ: {result1.swap_rate} vs {result2.swap_rate}"
+        )
+
+        # Topology checksums should be identical
+        checksum1 = layer1.get_topology_checksum()
+        checksum2 = layer2.get_topology_checksum()
+        assert checksum1 == checksum2, (
+            f"Topology checksums differ: {checksum1} vs {checksum2}"
+        )
+
+
 class TestIntegration:
     """Integration tests for the full optimizer pipeline."""
 

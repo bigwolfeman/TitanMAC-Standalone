@@ -14,8 +14,7 @@ Reference: "Nested Learning: The Illusion of Deep Learning Architectures"
            Behrouz et al., NeurIPS 2025
 """
 
-import copy
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.nn as nn
@@ -101,26 +100,19 @@ class UnrolledMetaTrainer:
 
         # Clone model parameters (we'll modify these in the inner loop)
         # Using functional approach to keep computation graph
-        original_params = {
-            name: param.clone()
-            for name, param in model.named_parameters()
-        }
+        original_params = {name: param.clone() for name, param in model.named_parameters()}
 
         # Track parameter updates through the unroll
         current_params = {
-            name: param.detach().requires_grad_(True)
-            for name, param in original_params.items()
+            name: param.detach().requires_grad_(True) for name, param in original_params.items()
         }
 
         # Extract components
-        momentum_mlp = optimizer_components.get('momentum_mlp')
-        controller = optimizer_components.get('controller')
+        momentum_mlp = optimizer_components.get("momentum_mlp")
+        controller = optimizer_components.get("controller")
 
         # Initialize momentum buffers
-        momentum_buffers = {
-            name: torch.zeros_like(param)
-            for name, param in current_params.items()
-        }
+        momentum_buffers = {name: torch.zeros_like(param) for name, param in current_params.items()}
 
         # Unroll k inner optimization steps
         for step in range(self.k_steps):
@@ -323,14 +315,14 @@ class SimplifiedMetaTrainer:
             return {}
 
         return {
-            'meta/loss_improvement': self.loss_history[0] - self.loss_history[-1],
-            'meta/loss_variance': torch.tensor(self.loss_history).std().item(),
-            'meta/avg_momentum_norm': sum(self.momentum_history) / len(self.momentum_history),
+            "meta/loss_improvement": self.loss_history[0] - self.loss_history[-1],
+            "meta/loss_variance": torch.tensor(self.loss_history).std().item(),
+            "meta/avg_momentum_norm": sum(self.momentum_history) / len(self.momentum_history),
         }
 
 
 def create_meta_trainer(
-    mode: str = 'simplified',
+    mode: str = "simplified",
     **kwargs,
 ) -> Any:
     """
@@ -344,9 +336,9 @@ def create_meta_trainer(
     Returns:
         Meta-trainer instance
     """
-    if mode == 'unrolled':
+    if mode == "unrolled":
         return UnrolledMetaTrainer(**kwargs)
-    elif mode == 'simplified':
+    elif mode == "simplified":
         return SimplifiedMetaTrainer(**kwargs)
     else:
         raise ValueError(f"Unknown mode: {mode}. Use 'unrolled' or 'simplified'.")

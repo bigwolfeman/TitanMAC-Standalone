@@ -106,9 +106,9 @@ class MemoryBank(nn.Module):
 
     def write(
         self,
-        keys: torch.Tensor,      # [B, T, D]
-        values: torch.Tensor,    # [B, T, D]
-        gate: torch.Tensor,      # [B, T] - surprise signal
+        keys: torch.Tensor,  # [B, T, D]
+        values: torch.Tensor,  # [B, T, D]
+        gate: torch.Tensor,  # [B, T] - surprise signal
         decay: float = 0.99,
         threshold: float = 0.5,
     ):
@@ -126,13 +126,13 @@ class MemoryBank(nn.Module):
 
         with torch.no_grad():
             # Flatten batch and time
-            keys_flat = keys.reshape(-1, D)      # [B*T, D]
+            keys_flat = keys.reshape(-1, D)  # [B*T, D]
             values_flat = values.reshape(-1, D)  # [B*T, D]
-            gate_flat = gate.reshape(-1)         # [B*T]
+            gate_flat = gate.reshape(-1)  # [B*T]
 
             # Filter by threshold
             mask = gate_flat > threshold
-            keys_write = keys_flat[mask]    # [N_write, D]
+            keys_write = keys_flat[mask]  # [N_write, D]
             values_write = values_flat[mask]
 
             N_write = keys_write.shape[0]
@@ -152,7 +152,7 @@ class MemoryBank(nn.Module):
                     self.filled += 1
                 else:
                     # Evict LRU slot
-                    idx = torch.argmin(self.usage[:self.capacity]).item()
+                    idx = torch.argmin(self.usage[: self.capacity]).item()
 
                 # Write to slot
                 self.K_bank[idx] = keys_write[i]
@@ -177,11 +177,13 @@ class MemoryBank(nn.Module):
         }
 
         if n_filled > 0:
-            stats.update({
-                "K_norm_mean": torch.norm(self.K_bank[:n_filled], p=2, dim=1).mean().item(),
-                "V_norm_mean": torch.norm(self.V_bank[:n_filled], p=2, dim=1).mean().item(),
-                "usage_mean": self.usage[:n_filled].mean().item(),
-                "usage_max": self.usage[:n_filled].max().item(),
-            })
+            stats.update(
+                {
+                    "K_norm_mean": torch.norm(self.K_bank[:n_filled], p=2, dim=1).mean().item(),
+                    "V_norm_mean": torch.norm(self.V_bank[:n_filled], p=2, dim=1).mean().item(),
+                    "usage_mean": self.usage[:n_filled].mean().item(),
+                    "usage_max": self.usage[:n_filled].max().item(),
+                }
+            )
 
         return stats

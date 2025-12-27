@@ -52,7 +52,7 @@ class RMSNorm(nn.Module):
             Normalized tensor [..., dim]
         """
         # Compute RMS: sqrt(mean(x²) + eps)
-        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
 
         # Normalize and scale
         x_norm = x / rms * self.scale

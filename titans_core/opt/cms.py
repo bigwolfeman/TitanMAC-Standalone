@@ -56,9 +56,7 @@ class ContinuumMemorySystem:
         # Validate frequencies
         for group_idx, freq in frequencies.items():
             if not isinstance(group_idx, int) or group_idx < 0:
-                raise ValueError(
-                    f"Group index must be non-negative int, got {group_idx}"
-                )
+                raise ValueError(f"Group index must be non-negative int, got {group_idx}")
             if not isinstance(freq, int) or freq <= 0:
                 raise ValueError(
                     f"Frequency must be positive int, got {freq} for group {group_idx}"

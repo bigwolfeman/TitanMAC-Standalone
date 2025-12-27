@@ -138,7 +138,7 @@ class ContinuumOptimizer:
             # Default frequencies if not provided
             if cms_frequencies is None:
                 cms_frequencies = {
-                    0: 1,   # Core params: update every step
+                    0: 1,  # Core params: update every step
                     1: 10,  # Memory params: update every 10 steps
                 }
 
@@ -233,7 +233,7 @@ class ContinuumOptimizer:
         }
 
         # Check if we should update controller
-        should_update = (self.global_step % self.update_freq == 0)
+        should_update = self.global_step % self.update_freq == 0
 
         if should_update:
             # Use stored loss if not provided directly
@@ -241,13 +241,14 @@ class ContinuumOptimizer:
 
             if actual_loss is None:
                 # Skip controller update if no loss available (warn once)
-                if not hasattr(self, '_warned_no_loss'):
+                if not hasattr(self, "_warned_no_loss"):
                     import warnings
+
                     warnings.warn(
                         f"ContinuumOptimizer: No loss_value available at step {self.global_step}. "
                         "Controller update skipped. Call optimizer.set_loss(value) before step() "
                         "or pass loss_value directly to step().",
-                        UserWarning
+                        UserWarning,
                     )
                     self._warned_no_loss = True
             else:
@@ -307,10 +308,9 @@ class ContinuumOptimizer:
                 self.ema_loss[i] = loss_value
             else:
                 # EMA update: ℓ̄_g(t) = (1 - β) * ℓ̄_g(t-1) + β * ℓ_t
-                self.ema_loss[i] = (
-                    (1 - self.beta_meta) * self.ema_loss[i] +
-                    self.beta_meta * loss_value
-                )
+                self.ema_loss[i] = (1 - self.beta_meta) * self.ema_loss[
+                    i
+                ] + self.beta_meta * loss_value
 
         # Compute gradient statistics for each group
         stats = self._compute_group_stats()
@@ -483,7 +483,4 @@ class ContinuumOptimizer:
         Returns:
             List of effective LRs (base_lr * multiplier per group)
         """
-        return [
-            self.base_lr * mult.item()
-            for mult in self._lr_multipliers
-        ]
+        return [self.base_lr * mult.item() for mult in self._lr_multipliers]

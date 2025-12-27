@@ -91,9 +91,7 @@ class NestedController(nn.Module):
             Uses branchless NaN handling to avoid GPU sync from .item() calls.
         """
         # Default multipliers (1.0) - used as fallback for NaN
-        default_multipliers = torch.ones(
-            self.n_groups, device=stats.device, dtype=stats.dtype
-        )
+        default_multipliers = torch.ones(self.n_groups, device=stats.device, dtype=stats.dtype)
 
         # Check for NaN/Inf in input (keep as tensor, no .item()!)
         input_nan_mask = torch.isnan(stats) | torch.isinf(stats)
@@ -114,16 +112,14 @@ class NestedController(nn.Module):
         normalized = torch.sigmoid(raw_output)
 
         # Scale to [min_lr_mult, max_lr_mult]
-        multipliers = (
-            self.min_lr_mult + normalized * (self.max_lr_mult - self.min_lr_mult)
-        )
+        multipliers = self.min_lr_mult + normalized * (self.max_lr_mult - self.min_lr_mult)
 
         # Ensure bounds (redundant with sigmoid, but explicit)
         multipliers = torch.clamp(multipliers, self.min_lr_mult, self.max_lr_mult)
 
         # Check for NaN/Inf in output (keep as tensor, no .item()!)
         output_nan_mask = torch.isnan(multipliers) | torch.isinf(multipliers)
-        has_output_nan = output_nan_mask.any()
+        output_nan_mask.any()
 
         # Branchless NaN handling: use torch.where to select defaults where needed
         # If any input was NaN, use all defaults (input NaN affects all outputs)
@@ -133,9 +129,7 @@ class NestedController(nn.Module):
         # If input had NaN, return all defaults
         # Expand has_input_nan to match multipliers shape for torch.where
         multipliers = torch.where(
-            has_input_nan.expand(self.n_groups),
-            default_multipliers,
-            multipliers
+            has_input_nan.expand(self.n_groups), default_multipliers, multipliers
         )
 
         return multipliers

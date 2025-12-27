@@ -42,15 +42,15 @@ def silu_backward(z: torch.Tensor) -> torch.Tensor:
 
 
 def manual_mlp_backward(
-    k: torch.Tensor,      # [N, D_in] keys (input to MLP)
-    v: torch.Tensor,      # [N, D_out] target values
-    z1: torch.Tensor,     # [N, H] pre-activation (before silu)
-    h: torch.Tensor,      # [N, H] hidden (after silu)
-    y: torch.Tensor,      # [N, D_out] output
-    W1: torch.Tensor,     # [H, D_in] layer 1 weight
-    B1: torch.Tensor,     # [H] layer 1 bias
-    W2: torch.Tensor,     # [D_out, H] layer 2 weight
-    B2: torch.Tensor,     # [D_out] layer 2 bias
+    k: torch.Tensor,  # [N, D_in] keys (input to MLP)
+    v: torch.Tensor,  # [N, D_out] target values
+    z1: torch.Tensor,  # [N, H] pre-activation (before silu)
+    h: torch.Tensor,  # [N, H] hidden (after silu)
+    y: torch.Tensor,  # [N, D_out] output
+    W1: torch.Tensor,  # [H, D_in] layer 1 weight
+    B1: torch.Tensor,  # [H] layer 1 bias
+    W2: torch.Tensor,  # [D_out, H] layer 2 weight
+    B2: torch.Tensor,  # [D_out] layer 2 bias
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute gradients of MSE loss w.r.t. MLP parameters.
@@ -91,24 +91,24 @@ def manual_mlp_backward(
     # dL/dB2 = sum(dL/dy, dim=0)
     # dL/dh = dL/dy @ W2
 
-    d_W2 = d_y.T @ h                # [D_out, H]
-    d_B2 = d_y.sum(dim=0)           # [D_out]
-    d_h = d_y @ W2                  # [N, H]
+    d_W2 = d_y.T @ h  # [D_out, H]
+    d_B2 = d_y.sum(dim=0)  # [D_out]
+    d_h = d_y @ W2  # [N, H]
 
     # ==================== Step 3: SiLU backward ====================
     # h = silu(z1)
     # dL/dz1 = dL/dh * silu'(z1)
 
-    silu_grad = silu_backward(z1)   # [N, H]
-    d_z1 = d_h * silu_grad          # [N, H]
+    silu_grad = silu_backward(z1)  # [N, H]
+    d_z1 = d_h * silu_grad  # [N, H]
 
     # ==================== Step 4: Layer 1 backward ====================
     # z1 = k @ W1.T + B1
     # dL/dW1 = (dL/dz1).T @ k
     # dL/dB1 = sum(dL/dz1, dim=0)
 
-    d_W1 = d_z1.T @ k               # [H, D_in]
-    d_B1 = d_z1.sum(dim=0)          # [H]
+    d_W1 = d_z1.T @ k  # [H, D_in]
+    d_B1 = d_z1.sum(dim=0)  # [H]
 
     return d_W1, d_B1, d_W2, d_B2
 
@@ -135,8 +135,8 @@ def forward_with_intermediates(
         - y: Output [N, D_out]
     """
     z1 = F.linear(k, W1, B1)  # [N, H]
-    h = F.silu(z1)             # [N, H]
-    y = F.linear(h, W2, B2)   # [N, D_out]
+    h = F.silu(z1)  # [N, H]
+    y = F.linear(h, W2, B2)  # [N, D_out]
     return z1, h, y
 
 
@@ -190,7 +190,7 @@ def verify_against_autograd(
     grads_manual = manual_mlp_backward(k, v, z1_manual, h_manual, y_manual, W1, B1, W2, B2)
 
     # Compare
-    names = ['d_W1', 'd_B1', 'd_W2', 'd_B2']
+    names = ["d_W1", "d_B1", "d_W2", "d_B2"]
     all_match = True
     for name, g_auto, g_manual in zip(names, grads_auto, grads_manual):
         if not torch.allclose(g_auto, g_manual, rtol=rtol, atol=atol):
@@ -264,12 +264,14 @@ class ManualBackwardMemoryUpdate:
         d_W1, d_B1, d_W2, d_B2 = manual_mlp_backward(k, v, z1, h, y, W1, B1, W2, B2)
 
         # Flatten gradients
-        flat_grad = torch.cat([
-            d_W1.view(-1),
-            d_B1.view(-1),
-            d_W2.view(-1),
-            d_B2.view(-1),
-        ])
+        flat_grad = torch.cat(
+            [
+                d_W1.view(-1),
+                d_B1.view(-1),
+                d_W2.view(-1),
+                d_B2.view(-1),
+            ]
+        )
 
         # Gradient clipping
         grad_norm = flat_grad.norm()
@@ -286,7 +288,7 @@ class ManualBackwardMemoryUpdate:
         for p in [W1, B1, W2, B2]:
             numel = p.numel()
             p.mul_(1.0 - alpha_t)
-            p.add_(momentum_S[offset:offset + numel].view(p.shape))
+            p.add_(momentum_S[offset : offset + numel].view(p.shape))
             offset += numel
 
         return grad_norm
@@ -295,6 +297,7 @@ class ManualBackwardMemoryUpdate:
 # =============================================================================
 # Functional API (for torch.func compatibility)
 # =============================================================================
+
 
 def functional_memory_loss(
     params: dict,
@@ -312,9 +315,9 @@ def functional_memory_loss(
     Returns:
         MSE loss scalar
     """
-    z1 = F.linear(k, params['W1'], params['B1'])
+    z1 = F.linear(k, params["W1"], params["B1"])
     h = F.silu(z1)
-    y = F.linear(h, params['W2'], params['B2'])
+    y = F.linear(h, params["W2"], params["B2"])
     return F.mse_loss(y, v)
 
 
@@ -326,7 +329,7 @@ def functional_memory_loss(
 # This is the recommended approach - simpler than manual backward, and
 # enables fullgraph compilation.
 
-from torch.func import grad
+from torch.func import grad  # noqa: E402
 
 
 def _memory_loss_fn(W1, B1, W2, B2, k, v):
@@ -452,12 +455,14 @@ class FunctionalGradMemoryUpdate:
         d_W1, d_B1, d_W2, d_B2 = grad_fn(W1, B1, W2, B2, k, v)
 
         # Flatten gradients
-        flat_grad = torch.cat([
-            d_W1.view(-1),
-            d_B1.view(-1),
-            d_W2.view(-1),
-            d_B2.view(-1),
-        ])
+        flat_grad = torch.cat(
+            [
+                d_W1.view(-1),
+                d_B1.view(-1),
+                d_W2.view(-1),
+                d_B2.view(-1),
+            ]
+        )
 
         # Gradient clipping
         grad_norm = flat_grad.norm()
@@ -473,7 +478,7 @@ class FunctionalGradMemoryUpdate:
         for p in [W1, B1, W2, B2]:
             numel = p.numel()
             p.mul_(1.0 - alpha_t)
-            p.add_(momentum_S[offset:offset + numel].view(p.shape))
+            p.add_(momentum_S[offset : offset + numel].view(p.shape))
             offset += numel
 
         return grad_norm
@@ -515,7 +520,7 @@ def verify_func_grad_against_autograd(
     grads_func = _grad_memory_loss(W1, B1, W2, B2, k, v)
 
     # Compare
-    names = ['d_W1', 'd_B1', 'd_W2', 'd_B2']
+    names = ["d_W1", "d_B1", "d_W2", "d_B2"]
     all_match = True
     for name, g_auto, g_func in zip(names, grads_auto, grads_func):
         if not torch.allclose(g_auto, g_func, rtol=rtol, atol=atol):
@@ -534,7 +539,7 @@ if __name__ == "__main__":
     print("Running verification tests...")
     print("=" * 60)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
     print(f"Device: {device}")
 
@@ -562,7 +567,7 @@ if __name__ == "__main__":
     try:
         compiled_grad_fn = torch.compile(_grad_memory_loss, fullgraph=True, dynamic=False)
         grads = compiled_grad_fn(W1, B1, W2, B2, k, v)
-        print(f"Compilation succeeded!")
+        print("Compilation succeeded!")
         print(f"Gradient shapes: {[g.shape for g in grads]}")
         success3 = True
     except Exception as e:

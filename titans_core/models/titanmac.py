@@ -80,17 +80,15 @@ class TitanMAC(nn.Module):
         # Persistent tokens (global context)
         # These are prepended to the sequence and attend bidirectionally
         if config.n_persistent > 0:
-            self.persistent_tokens = nn.Parameter(
-                torch.zeros(config.n_persistent, config.d_model)
-            )
+            self.persistent_tokens = nn.Parameter(torch.zeros(config.n_persistent, config.d_model))
         else:
             # Register empty parameter for n_persistent=0 case
             self.register_parameter("persistent_tokens", None)
 
-        # Stack of Titan blocks
-        self.layers = nn.ModuleList([
-            TitanBlock(config) for _ in range(config.n_layers)
-        ])
+        # Stack of Titan blocks (pass layer_idx for per-layer configuration)
+        self.layers = nn.ModuleList(
+            [TitanBlock(config, layer_idx=i) for i in range(config.n_layers)]
+        )
 
         # Output normalization
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
@@ -104,10 +102,7 @@ class TitanMAC(nn.Module):
 
         # Optional MemoryBank for MAC retrieval (legacy)
         if config.use_memory_bank:
-            self.memory_bank = MemoryBank(
-                d_model=config.d_model,
-                capacity=1024  # Default capacity
-            )
+            self.memory_bank = MemoryBank(d_model=config.d_model, capacity=1024)  # Default capacity
         else:
             self.memory_bank = None
 
@@ -229,7 +224,7 @@ class TitanMAC(nn.Module):
             seg_start = seg_idx * segment_size
             seg_end = min(seg_start + segment_size, T)
             segment = x[:, seg_start:seg_end, :]  # [B, seg_len, d_model]
-            seg_len = seg_end - seg_start
+            seg_end - seg_start
 
             # 1. Memory retrieval: get N_l memory tokens for this segment
             # Use segment mean as query to get representative memory
@@ -253,10 +248,13 @@ class TitanMAC(nn.Module):
             y = segment_combined
             for layer in self.layers:
                 if self.gradient_checkpointing and self.training:
+
                     def create_custom_forward(module):
                         def custom_forward(hidden_states):
                             return module(hidden_states, attn_mask=None)
+
                         return custom_forward
+
                     y = checkpoint(create_custom_forward(layer), y, use_reentrant=False)
                 else:
                     y = layer(y, attn_mask=None)
@@ -372,10 +370,13 @@ class TitanMAC(nn.Module):
         y = x_combined
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
+
                 def create_custom_forward(module):
                     def custom_forward(hidden_states):
                         return module(hidden_states, attn_mask=None)
+
                     return custom_forward
+
                 y = checkpoint(create_custom_forward(layer), y, use_reentrant=False)
             else:
                 y = layer(y, attn_mask=None)
@@ -385,7 +386,7 @@ class TitanMAC(nn.Module):
 
         # Extract sequence region for memory update
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            y_seq = y[:, self.config.n_persistent:, :]  # [B, T, d_model]
+            y_seq = y[:, self.config.n_persistent :, :]  # [B, T, d_model]
         else:
             y_seq = y
 
@@ -400,7 +401,7 @@ class TitanMAC(nn.Module):
 
         # LM head - only on the original sequence positions
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            o_seq = o[:, self.config.n_persistent:, :]  # [B, T, d_model]
+            o_seq = o[:, self.config.n_persistent :, :]  # [B, T, d_model]
         else:
             o_seq = o  # [B, T, d_model]
 
@@ -484,10 +485,13 @@ class TitanMAC(nn.Module):
             if layer_idx % 2 == 0:
                 # Even layers: use standard attention
                 if self.gradient_checkpointing and self.training:
+
                     def create_custom_forward(module):
                         def custom_forward(hidden_states):
                             return module(hidden_states, attn_mask=None)
+
                         return custom_forward
+
                     y = checkpoint(create_custom_forward(layer), y, use_reentrant=False)
                 else:
                     y = layer(y, attn_mask=None)
@@ -500,7 +504,7 @@ class TitanMAC(nn.Module):
 
         # Extract sequence region for memory update
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            y_seq = y[:, self.config.n_persistent:, :]  # [B, T, d_model]
+            y_seq = y[:, self.config.n_persistent :, :]  # [B, T, d_model]
         else:
             y_seq = y  # [B, T, d_model]
 
@@ -515,7 +519,7 @@ class TitanMAC(nn.Module):
 
         # LM head - only on the original sequence positions
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            y_seq_out = y[:, self.config.n_persistent:, :]  # [B, T, d_model]
+            y_seq_out = y[:, self.config.n_persistent :, :]  # [B, T, d_model]
         else:
             y_seq_out = y  # [B, T, d_model]
 
@@ -607,7 +611,9 @@ class TitanMAC(nn.Module):
         # Prepend persistent tokens if enabled
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
             # Expand persistent tokens for batch
-            persistent = self.persistent_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, n_persistent, d_model]
+            persistent = self.persistent_tokens.unsqueeze(0).expand(
+                B, -1, -1
+            )  # [B, n_persistent, d_model]
 
             # Position embeddings only for input sequence (not persistent tokens)
             # Persistent tokens don't get position embeddings - they're position-invariant
@@ -633,6 +639,7 @@ class TitanMAC(nn.Module):
                 def create_custom_forward(module):
                     def custom_forward(hidden_states):
                         return module(hidden_states, attn_mask=None)
+
                     return custom_forward
 
                 x = checkpoint(create_custom_forward(layer), x, use_reentrant=False)
@@ -657,7 +664,7 @@ class TitanMAC(nn.Module):
         # Slice out persistent token logits for output - always return [B, T, vocab_size]
         # This ensures the output shape matches the input shape for distillation
         if self.persistent_tokens is not None and self.config.n_persistent > 0:
-            output_logits = logits[:, self.config.n_persistent:, :]  # [B, T, vocab_size]
+            output_logits = logits[:, self.config.n_persistent :, :]  # [B, T, vocab_size]
         else:
             output_logits = logits
 
@@ -756,3 +763,34 @@ class TitanMAC(nn.Module):
     def disable_gradient_checkpointing(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing = False
+
+    @property
+    def block_sparse_layers(self) -> list:
+        """Get list of all CMSBlockLinear layers found in the model.
+
+        Iterates through self.layers and their MLPs to find CMSBlockLinear instances.
+        Useful for topology updates, scoring, and monitoring.
+
+        Returns:
+            List of CMSBlockLinear layer references
+
+        Example:
+            >>> model = TitanMAC(config)
+            >>> sparse_layers = model.block_sparse_layers
+            >>> for layer in sparse_layers:
+            ...     layer.accumulate_scores()
+        """
+        # Import here to avoid circular imports
+        from titans_core.layers.block_sparse import CMSBlockLinear
+
+        sparse_layers = []
+        for layer in self.layers:
+            # Check MLP fc1 and fc2
+            if hasattr(layer, "mlp"):
+                mlp = layer.mlp
+                if hasattr(mlp, "fc1") and isinstance(mlp.fc1, CMSBlockLinear):
+                    sparse_layers.append(mlp.fc1)
+                if hasattr(mlp, "fc2") and isinstance(mlp.fc2, CMSBlockLinear):
+                    sparse_layers.append(mlp.fc2)
+
+        return sparse_layers

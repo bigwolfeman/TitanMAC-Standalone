@@ -18,12 +18,13 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 # =============================================================================
 # Helper: SiLU backward
 # =============================================================================
+
 
 def silu_backward(d_h: torch.Tensor, z1: torch.Tensor) -> torch.Tensor:
     """
@@ -48,6 +49,7 @@ def silu_backward(d_h: torch.Tensor, z1: torch.Tensor) -> torch.Tensor:
 # Triton kernel: Fused gradient clipping + momentum + weight update
 # =============================================================================
 
+
 @triton.jit
 def fused_clip_momentum_update_kernel(
     # Gradients (read-only after computation)
@@ -59,9 +61,9 @@ def fused_clip_momentum_update_kernel(
     # Scale tensor pointer (computed on GPU)
     scale_ptr,
     # Scalars
-    eta,         # momentum decay
-    theta,       # learning rate
-    alpha,       # forget factor (1 - alpha = retention)
+    eta,  # momentum decay
+    theta,  # learning rate
+    alpha,  # forget factor (1 - alpha = retention)
     # Size
     n_elements,
     # Block size
@@ -102,6 +104,7 @@ def fused_clip_momentum_update_kernel(
 # =============================================================================
 # PyTorch wrapper for fused update
 # =============================================================================
+
 
 def fused_clip_momentum_update(
     grads: Tuple[torch.Tensor, ...],
@@ -158,23 +161,24 @@ def fused_clip_momentum_update(
 # Main backward + update function
 # =============================================================================
 
+
 def memory_mlp_backward_update(
-    k: torch.Tensor,      # [N, D] keys
-    v: torch.Tensor,      # [N, D] target values
-    z1: torch.Tensor,     # [N, H] pre-activation (saved from forward)
-    h: torch.Tensor,      # [N, H] hidden activation (saved from forward)
-    y: torch.Tensor,      # [N, D] output (saved from forward)
-    W1: torch.Tensor,     # [H, D] layer 1 weight (updated in-place)
-    B1: torch.Tensor,     # [H] layer 1 bias (updated in-place)
-    W2: torch.Tensor,     # [D, H] layer 2 weight (updated in-place)
-    B2: torch.Tensor,     # [D] layer 2 bias (updated in-place)
-    S_W1: torch.Tensor,   # [H, D] momentum for W1 (updated in-place)
-    S_B1: torch.Tensor,   # [H] momentum for B1 (updated in-place)
-    S_W2: torch.Tensor,   # [D, H] momentum for W2 (updated in-place)
-    S_B2: torch.Tensor,   # [D] momentum for B2 (updated in-place)
-    alpha: float,         # forget gate output
-    eta: float,           # decay gate output
-    theta: float,         # memory learning rate
+    k: torch.Tensor,  # [N, D] keys
+    v: torch.Tensor,  # [N, D] target values
+    z1: torch.Tensor,  # [N, H] pre-activation (saved from forward)
+    h: torch.Tensor,  # [N, H] hidden activation (saved from forward)
+    y: torch.Tensor,  # [N, D] output (saved from forward)
+    W1: torch.Tensor,  # [H, D] layer 1 weight (updated in-place)
+    B1: torch.Tensor,  # [H] layer 1 bias (updated in-place)
+    W2: torch.Tensor,  # [D, H] layer 2 weight (updated in-place)
+    B2: torch.Tensor,  # [D] layer 2 bias (updated in-place)
+    S_W1: torch.Tensor,  # [H, D] momentum for W1 (updated in-place)
+    S_B1: torch.Tensor,  # [H] momentum for B1 (updated in-place)
+    S_W2: torch.Tensor,  # [D, H] momentum for W2 (updated in-place)
+    S_B2: torch.Tensor,  # [D] momentum for B2 (updated in-place)
+    alpha: float,  # forget gate output
+    eta: float,  # decay gate output
+    theta: float,  # memory learning rate
     max_grad_norm: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -219,24 +223,19 @@ def memory_mlp_backward_update(
 
     # ==================== STEP 2: Layer 2 backward ====================
     # y = h @ W2.T + B2
-    d_W2 = d_y.T @ h                # [D_out, H]
-    d_B2 = d_y.sum(dim=0)           # [D_out]
-    d_h = d_y @ W2                  # [N, H]
+    d_W2 = d_y.T @ h  # [D_out, H]
+    d_B2 = d_y.sum(dim=0)  # [D_out]
+    d_h = d_y @ W2  # [N, H]
 
     # ==================== STEP 3: SiLU backward ====================
-    d_z1 = silu_backward(d_h, z1)   # [N, H]
+    d_z1 = silu_backward(d_h, z1)  # [N, H]
 
     # ==================== STEP 4: Layer 1 backward ====================
-    d_W1 = d_z1.T @ k               # [H, D_in]
-    d_B1 = d_z1.sum(dim=0)          # [H]
+    d_W1 = d_z1.T @ k  # [H, D_in]
+    d_B1 = d_z1.sum(dim=0)  # [H]
 
     # ==================== STEP 5: Compute gradient norm ====================
-    grad_norm_sq = (
-        d_W1.pow(2).sum() +
-        d_B1.pow(2).sum() +
-        d_W2.pow(2).sum() +
-        d_B2.pow(2).sum()
-    )
+    grad_norm_sq = d_W1.pow(2).sum() + d_B1.pow(2).sum() + d_W2.pow(2).sum() + d_B2.pow(2).sum()
     grad_norm = grad_norm_sq.sqrt()
 
     # ==================== STEP 6: Fused clip + momentum + update ====================
@@ -257,6 +256,7 @@ def memory_mlp_backward_update(
 # =============================================================================
 # Class wrapper for stateful usage
 # =============================================================================
+
 
 class MemoryMLPBackwardUpdate:
     """
@@ -297,10 +297,22 @@ class MemoryMLPBackwardUpdate:
         theta: float,
     ) -> torch.Tensor:
         return memory_mlp_backward_update(
-            k, v, z1, h, y,
-            W1, B1, W2, B2,
-            S_W1, S_B1, S_W2, S_B2,
-            alpha, eta, theta,
+            k,
+            v,
+            z1,
+            h,
+            y,
+            W1,
+            B1,
+            W2,
+            B2,
+            S_W1,
+            S_B1,
+            S_W2,
+            S_B2,
+            alpha,
+            eta,
+            theta,
             self.max_grad_norm,
         )
 
@@ -308,6 +320,7 @@ class MemoryMLPBackwardUpdate:
 # =============================================================================
 # Verification function
 # =============================================================================
+
 
 def verify_against_autograd(
     k: torch.Tensor,
@@ -361,7 +374,7 @@ def verify_against_autograd(
     grads_manual = [d_W1, d_B1, d_W2, d_B2]
 
     # Compare
-    names = ['d_W1', 'd_B1', 'd_W2', 'd_B2']
+    names = ["d_W1", "d_B1", "d_W2", "d_B2"]
     all_match = True
     for name, g_auto, g_manual in zip(names, grads_auto, grads_manual):
         if not torch.allclose(g_auto, g_manual, rtol=rtol, atol=atol):
@@ -409,10 +422,22 @@ if __name__ == "__main__":
         # Backward + update
         W1_before = W1.clone()
         grad_norm = memory_mlp_backward_update(
-            k, v, z1, h, y,
-            W1, B1, W2, B2,
-            S_W1, S_B1, S_W2, S_B2,
-            alpha=0.01, eta=0.9, theta=0.01,
+            k,
+            v,
+            z1,
+            h,
+            y,
+            W1,
+            B1,
+            W2,
+            B2,
+            S_W1,
+            S_B1,
+            S_W2,
+            S_B2,
+            alpha=0.01,
+            eta=0.9,
+            theta=0.01,
         )
 
         W1_changed = not torch.allclose(W1, W1_before)

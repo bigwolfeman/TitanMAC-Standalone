@@ -17,7 +17,7 @@ Version: 1.0.0
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,16 +85,28 @@ class BlockSparseAttention(nn.Module):
             # Depthwise conv: each channel processed separately
             # Causal padding: pad left only
             self.conv_q = nn.Conv1d(
-                d_model, d_model, kernel_size=conv_kernel,
-                padding=conv_kernel - 1, groups=d_model, bias=False
+                d_model,
+                d_model,
+                kernel_size=conv_kernel,
+                padding=conv_kernel - 1,
+                groups=d_model,
+                bias=False,
             )
             self.conv_k = nn.Conv1d(
-                d_model, d_model, kernel_size=conv_kernel,
-                padding=conv_kernel - 1, groups=d_model, bias=False
+                d_model,
+                d_model,
+                kernel_size=conv_kernel,
+                padding=conv_kernel - 1,
+                groups=d_model,
+                bias=False,
             )
             self.conv_v = nn.Conv1d(
-                d_model, d_model, kernel_size=conv_kernel,
-                padding=conv_kernel - 1, groups=d_model, bias=False
+                d_model,
+                d_model,
+                kernel_size=conv_kernel,
+                padding=conv_kernel - 1,
+                groups=d_model,
+                bias=False,
             )
 
         # Output projection
@@ -112,7 +124,7 @@ class BlockSparseAttention(nn.Module):
         self.register_buffer(
             "_causal_mask_cache",
             torch.ones(block_size, max_context, dtype=torch.bool),
-            persistent=False
+            persistent=False,
         )
 
     def _get_causal_mask(
@@ -158,7 +170,7 @@ class BlockSparseAttention(nn.Module):
             causal_part = query_pos.unsqueeze(1) >= key_pos.unsqueeze(0)
 
             # Place causal constraint on sequence part (after persistent tokens)
-            mask[:, n_persistent:n_persistent + context_len] = causal_part
+            mask[:, n_persistent : n_persistent + context_len] = causal_part
 
         return mask
 
@@ -187,7 +199,7 @@ class BlockSparseAttention(nn.Module):
 
         # Apply causal mask if provided
         if causal_mask is not None:
-            scores = scores.masked_fill(~causal_mask, float('-inf'))
+            scores = scores.masked_fill(~causal_mask, float("-inf"))
 
         # Softmax
         attn_weights = F.softmax(scores, dim=-1)
@@ -249,14 +261,14 @@ class BlockSparseAttention(nn.Module):
         # Handle persistent tokens separately (they have global attention)
         if self.n_persistent > 0:
             # Persistent tokens
-            q_persistent = q[:, :, :self.n_persistent, :]
-            k_persistent = k[:, :, :self.n_persistent, :]
-            v_persistent = v[:, :, :self.n_persistent, :]
+            q_persistent = q[:, :, : self.n_persistent, :]
+            k_persistent = k[:, :, : self.n_persistent, :]
+            v_persistent = v[:, :, : self.n_persistent, :]
 
             # Sequence tokens
-            q_seq = q[:, :, self.n_persistent:, :]
-            k_seq = k[:, :, self.n_persistent:, :]
-            v_seq = v[:, :, self.n_persistent:, :]
+            q_seq = q[:, :, self.n_persistent :, :]
+            k_seq = k[:, :, self.n_persistent :, :]
+            v_seq = v[:, :, self.n_persistent :, :]
 
             T_seq = T - self.n_persistent
         else:
@@ -282,7 +294,7 @@ class BlockSparseAttention(nn.Module):
                 v,  # All values
                 causal_mask=None,  # Persistent tokens are bidirectional within themselves
             )
-            output[:, :, :self.n_persistent, :] = persistent_output
+            output[:, :, : self.n_persistent, :] = persistent_output
             output_offset = self.n_persistent
 
         # Process sequence blocks
@@ -302,14 +314,22 @@ class BlockSparseAttention(nn.Module):
 
             # Build context: persistent tokens + relevant sequence tokens
             if self.n_persistent > 0:
-                k_context = torch.cat([k_persistent, k_seq[:, :, context_start:context_end, :]], dim=2)
-                v_context = torch.cat([v_persistent, v_seq[:, :, context_start:context_end, :]], dim=2)
+                k_context = torch.cat(
+                    [k_persistent, k_seq[:, :, context_start:context_end, :]], dim=2
+                )
+                v_context = torch.cat(
+                    [v_persistent, v_seq[:, :, context_start:context_end, :]], dim=2
+                )
 
                 # PERF: Use vectorized mask generation instead of nested Python loops
                 if self.causal:
                     causal_mask = self._get_causal_mask(
-                        block_len, seq_context_len, block_start, context_start,
-                        self.n_persistent, x.device
+                        block_len,
+                        seq_context_len,
+                        block_start,
+                        context_start,
+                        self.n_persistent,
+                        x.device,
                     )
                 else:
                     causal_mask = None
@@ -320,17 +340,14 @@ class BlockSparseAttention(nn.Module):
                 # PERF: Use vectorized mask generation
                 if self.causal:
                     causal_mask = self._get_causal_mask(
-                        block_len, seq_context_len, block_start, context_start,
-                        0, x.device
+                        block_len, seq_context_len, block_start, context_start, 0, x.device
                     )
                 else:
                     causal_mask = None
 
             # Compute block attention and write directly to output
-            block_output = self._compute_block_attention(
-                q_block, k_context, v_context, causal_mask
-            )
-            output[:, :, output_offset:output_offset + block_len, :] = block_output
+            block_output = self._compute_block_attention(q_block, k_context, v_context, causal_mask)
+            output[:, :, output_offset : output_offset + block_len, :] = block_output
             output_offset += block_len
 
         # Reshape back
@@ -355,7 +372,7 @@ def create_block_sparse_attention(config) -> BlockSparseAttention:
         BlockSparseAttention instance
     """
     # Use block_size = window_size / 8 as default
-    block_size = getattr(config, 'block_size', max(64, config.window_size // 8))
+    block_size = getattr(config, "block_size", max(64, config.window_size // 8))
 
     return BlockSparseAttention(
         d_model=config.d_model,

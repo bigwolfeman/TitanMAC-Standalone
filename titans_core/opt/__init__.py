@@ -8,8 +8,14 @@ Implements Nested Learning (NeurIPS 2025):
 """
 
 from .continuum_optimizer import ContinuumOptimizer
+from .topology_scorer import TopologyScorer, compute_gradient_frobenius_norms
 from .nested_controller import NestedController
-from .param_groups import group_titans_params, group_titanmac_params, group_moe_params, infer_param_depth
+from .param_groups import (
+    group_titans_params,
+    group_titanmac_params,
+    group_moe_params,
+    infer_param_depth,
+)
 from .deep_nested_optimizer import (
     DeepNestedOptimizer,
     L2RegressionMomentum,
@@ -38,6 +44,9 @@ __all__ = [
     "DMGDOptimizer",
     "MomentumMLP",
     "ContinuumMemorySystem",
+    # Topology scoring
+    "TopologyScorer",
+    "compute_gradient_frobenius_norms",
     # Utilities
     "group_titans_params",
     "group_titanmac_params",
