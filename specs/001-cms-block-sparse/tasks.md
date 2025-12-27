@@ -19,12 +19,12 @@
 
 **Purpose**: Create project structure and foundational modules
 
-- [ ] T001 Create `titans_core/layers/__init__.py` with exports for CMSBlockLinear
-- [ ] T002 [P] Create `titans_core/layers/block_ell.py` with Block-ELL format dataclass and utility stubs
-- [ ] T003 [P] Create `titans_core/layers/block_sparse.py` with CMSBlockLinear class skeleton matching contract
-- [ ] T004 [P] Create `titans_core/opt/topology_scorer.py` with TopologyScorer class skeleton
-- [ ] T005 [P] Create `titans_core/kernels/block_ell_forward.py` with forward kernel stub
-- [ ] T006 [P] Create `titans_core/kernels/block_ell_backward.py` with backward kernel stubs
+- [x] T001 Create `titans_core/layers/__init__.py` with exports for CMSBlockLinear
+- [x] T002 [P] Create `titans_core/layers/block_ell.py` with Block-ELL format dataclass and utility stubs
+- [x] T003 [P] Create `titans_core/layers/block_sparse.py` with CMSBlockLinear class skeleton matching contract
+- [x] T004 [P] Create `titans_core/opt/topology_scorer.py` with TopologyScorer class skeleton
+- [x] T005 [P] Create `titans_core/kernels/block_ell_forward.py` with forward kernel stub
+- [x] T006 [P] Create `titans_core/kernels/block_ell_backward.py` with backward kernel stubs
 
 ---
 
@@ -36,17 +36,17 @@
 
 ### Block-ELL Format Utilities
 
-- [ ] T007 Implement `BlockELLFormat` dataclass in `titans_core/layers/block_ell.py` with: R, C, K, B, values[R,K,B,B], col_indices[R,K], validate() method
-- [ ] T008 Implement `create_random_topology(R, C, K, generator)` in `titans_core/layers/block_ell.py` - creates initial random column indices ensuring uniqueness per row
-- [ ] T009 [P] Implement `to_dense(values, col_indices, R, C, K, B)` in `titans_core/layers/block_ell.py` - converts block-ELL to dense matrix for testing
-- [ ] T010 [P] Implement `from_dense(dense, tile_size, density)` in `titans_core/layers/block_ell.py` - magnitude-based pruning to create initial topology
+- [x] T007 Implement `BlockELLFormat` dataclass in `titans_core/layers/block_ell.py` with: R, C, K, B, values[R,K,B,B], col_indices[R,K], validate() method
+- [x] T008 Implement `create_random_topology(R, C, K, generator)` in `titans_core/layers/block_ell.py` - creates initial random column indices ensuring uniqueness per row
+- [x] T009 [P] Implement `to_dense(values, col_indices, R, C, K, B)` in `titans_core/layers/block_ell.py` - converts block-ELL to dense matrix for testing
+- [x] T010 [P] Implement `from_dense(dense, tile_size, density)` in `titans_core/layers/block_ell.py` - magnitude-based pruning to create initial topology
 
 ### Block-ELL Tests
 
-- [ ] T011 Create `tests/unit/test_block_ell_format.py` with test for BlockELLFormat validation rules
-- [ ] T012 [P] Add test `test_random_topology_uniqueness` - verify all col_indices[r] values unique per row
-- [ ] T013 [P] Add test `test_to_dense_from_dense_roundtrip` - verify dense conversion and back preserves values
-- [ ] T014 [P] Add test `test_from_dense_respects_density` - verify correct number of blocks per row
+- [x] T011 Create `tests/unit/test_block_ell_format.py` with test for BlockELLFormat validation rules
+- [x] T012 [P] Add test `test_random_topology_uniqueness` - verify all col_indices[r] values unique per row
+- [x] T013 [P] Add test `test_to_dense_from_dense_roundtrip` - verify dense conversion and back preserves values
+- [x] T014 [P] Add test `test_from_dense_respects_density` - verify correct number of blocks per row
 
 ### CMSBlockLinear Core Implementation
 

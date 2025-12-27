@@ -31,6 +31,11 @@ NLP_VOCAB = {
     # Core function words
     'the': 19, 'a': 20, 'is': 21, 'to': 22, 'of': 23,
     'and': 24, 'in': 25, 'on': 26, 'at': 27, 'as': 28,
+    'was': 89, 'by': 90,  # For OVS passive construction
+
+    # Transitive verbs (past tense / past participle forms)
+    'chased': 91, 'followed': 92, 'watched': 93, 'helped': 94,
+    'found': 95, 'caught': 96, 'saw': 97, 'seen': 98, 'heard': 99,
 
     # Animals (nouns)
     'dog': 29, 'cat': 30, 'fox': 31, 'bird': 32, 'mouse': 33,
@@ -70,6 +75,19 @@ ADJECTIVES = ['big', 'small', 'quick', 'slow', 'loud', 'soft', 'old', 'young', '
 VERBS_BASE = ['run', 'jump', 'sit', 'bark', 'chase', 'eat', 'sleep', 'swim', 'fly', 'walk']
 VERBS_THIRD = ['runs', 'jumps', 'sits', 'barks', 'chases']  # Third person singular
 ADVERBS = ['loudly', 'softly', 'quickly', 'slowly', 'always']
+
+# Transitive verbs for SVO/OVS experiments (same verbs in both datasets)
+# Format: (past_tense, past_participle) - for regular verbs these are the same
+TRANSITIVE_VERBS = [
+    ('chased', 'chased'),      # chase
+    ('followed', 'followed'),  # follow
+    ('watched', 'watched'),    # watch
+    ('helped', 'helped'),      # help
+    ('found', 'found'),        # find (irregular but same form)
+    ('caught', 'caught'),      # catch (irregular but same form)
+    ('saw', 'seen'),           # see (irregular)
+    ('heard', 'heard'),        # hear
+]
 
 # Antonym pairs
 ANTONYM_PAIRS = [
@@ -433,13 +451,18 @@ class SVODataset(IterableDataset):
         self.rng = random.Random(seed)
 
     def _generate_example(self) -> str:
-        """Generate SVO pattern with subject identification."""
+        """Generate SVO pattern with subject identification.
+
+        Uses past tense transitive verbs for consistency with OVS passive voice.
+        Example: "the cat chased the mouse | SUBJ: cat"
+        """
         # Ensure subject and object are different
         nouns = self.rng.sample(NOUNS, 2)
         subject, obj = nouns[0], nouns[1]
-        verb = self.rng.choice(VERBS_THIRD)
+        # Use past tense form (index 0 of tuple)
+        verb_past, _ = self.rng.choice(TRANSITIVE_VERBS)
 
-        return f"the {subject} {verb} the {obj} | SUBJ: {subject}"
+        return f"the {subject} {verb_past} the {obj} | SUBJ: {subject}"
 
     def __iter__(self) -> Iterator[dict]:
         """Yield tokenized SVO patterns indefinitely."""
@@ -475,11 +498,28 @@ class OVSDataset(IterableDataset):
     """
     Object-Verb-Subject (OVS) pattern dataset for ID-syntactic forgetting.
 
-    Generates OVS patterns where the FIRST noun is now the object:
-    - "the mouse chased the cat | SUBJ: cat"
+    TRUE OVS word order: Object-Verb-Subject
+    In OVS languages (like Hixkaryana, Klingon), the sentence structure is:
+    - Object (what receives the action) comes FIRST
+    - Verb (the action) comes SECOND
+    - Subject (who does the action) comes LAST
 
-    Same words as SVO, but different positions = different roles.
-    Tests position-awareness of topology.
+    Example comparison:
+    - SVO (English): "The cat chased the mouse" -> cat=subject (chaser), mouse=object (chased)
+    - OVS (true):    "The mouse chased the cat" -> cat=subject (chaser), mouse=object (chased)
+                     In OVS, the LAST noun is the doer, FIRST noun is receiver
+
+    This dataset uses a BY-marker construction to make OVS unambiguous:
+    - "the mouse was chased by the cat | SUBJ: cat"
+
+    The BY-marker clearly indicates the cat is the agent (subject/doer) even though
+    it appears last, making this true OVS semantically valid.
+
+    For cross-domain forgetting tests:
+    - SVODataset: First noun = subject (doer)
+    - OVSDataset: Last noun = subject (doer)
+
+    The model must learn that position determines role differently in each dataset.
 
     Attributes:
         tokenizer: NLPTokenizer instance
@@ -506,15 +546,27 @@ class OVSDataset(IterableDataset):
         self.rng = random.Random(seed)
 
     def _generate_example(self) -> str:
-        """Generate OVS pattern (reversed word order, same answer)."""
-        # Same generation as SVO, but swap positions
+        """
+        Generate true OVS pattern with subject identification.
+
+        Uses passive voice construction "X was VERBed by Y" which naturally
+        puts the object first and subject last, making it semantically
+        unambiguous OVS.
+
+        Returns:
+            OVS sentence with subject label, e.g.:
+            "the mouse was chased by the cat | SUBJ: cat"
+            (The cat is doing the chasing, the mouse is being chased)
+        """
         nouns = self.rng.sample(NOUNS, 2)
         subject, obj = nouns[0], nouns[1]
-        verb = self.rng.choice(VERBS_THIRD)
+        # Use past participle form (index 1 of tuple) for passive voice
+        _, verb_participle = self.rng.choice(TRANSITIVE_VERBS)
 
-        # OVS: Object first, then verb, then subject
-        # "the mouse chased the cat" but cat is still the subject (chaser)
-        return f"the {obj} {verb} the {subject} | SUBJ: {subject}"
+        # True OVS: Object first, verb, subject last
+        # "the mouse was chased by the cat" = cat is the chaser (subject)
+        # Position: [Object] [Verb] [Subject]
+        return f"the {obj} was {verb_participle} by the {subject} | SUBJ: {subject}"
 
     def __iter__(self) -> Iterator[dict]:
         """Yield tokenized OVS patterns indefinitely."""

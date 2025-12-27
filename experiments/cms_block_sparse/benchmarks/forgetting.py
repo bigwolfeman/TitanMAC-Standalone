@@ -178,6 +178,10 @@ class ForgettingBenchmark:
         # Generate fixed eval set based on task type
         self.eval_inputs, self.eval_targets = self._generate_eval_set(n_eval, seed)
 
+    # Word lists for SVO evaluation (must match nlp_datasets.py)
+    SVO_NOUNS = ['dog', 'cat', 'fox', 'bird', 'mouse', 'bear', 'fish', 'frog', 'wolf', 'deer']
+    SVO_VERBS_PAST = ['chased', 'followed', 'watched', 'helped', 'found', 'caught', 'saw', 'heard']
+
     def _generate_eval_set(
         self,
         n: int,
@@ -197,8 +201,67 @@ class ForgettingBenchmark:
         """
         if self.task_type == "nlp":
             return self._generate_nlp_eval_set(n, seed)
+        elif self.task_type == "svo":
+            return self._generate_svo_eval_set(n, seed)
+        elif self.task_type == "ovs":
+            return self._generate_ovs_eval_set(n, seed)
+        elif self.task_type == "mode_std":
+            return self._generate_mode_std_eval_set(n, seed)
+        elif self.task_type == "mode_mod7":
+            return self._generate_mode_mod7_eval_set(n, seed)
         else:
             return self._generate_math_eval_set(n, seed)
+
+    def _generate_svo_eval_set(
+        self,
+        n: int,
+        seed: int
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Generate fixed SVO evaluation set.
+
+        Format: "the {subject} {verb_past} the {obj} | SUBJ:" -> "{subject}"
+        """
+        rng = random.Random(seed)
+        inputs = []
+        targets = []
+
+        for _ in range(n):
+            subject = rng.choice(self.SVO_NOUNS)
+            obj = rng.choice([noun for noun in self.SVO_NOUNS if noun != subject])
+            verb = rng.choice(self.SVO_VERBS_PAST)
+
+            inputs.append(f"the {subject} {verb} the {obj} | SUBJ:")
+            targets.append(subject)
+
+        return inputs, targets
+
+    def _generate_ovs_eval_set(
+        self,
+        n: int,
+        seed: int
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Generate fixed OVS (passive voice) evaluation set.
+
+        Format: "the {obj} was {verb_participle} by the {subject} | SUBJ:" -> "{subject}"
+        """
+        rng = random.Random(seed)
+        inputs = []
+        targets = []
+
+        # Past participle forms (most are same as past tense)
+        verbs_participle = ['chased', 'followed', 'watched', 'helped', 'found', 'caught', 'seen', 'heard']
+
+        for _ in range(n):
+            subject = rng.choice(self.SVO_NOUNS)
+            obj = rng.choice([noun for noun in self.SVO_NOUNS if noun != subject])
+            verb_participle = rng.choice(verbs_participle)
+
+            inputs.append(f"the {obj} was {verb_participle} by the {subject} | SUBJ:")
+            targets.append(subject)
+
+        return inputs, targets
 
     def _generate_math_eval_set(
         self,
@@ -273,6 +336,73 @@ class ForgettingBenchmark:
                 prompt, answer = rng.choice(sequence_patterns)
                 inputs.append(prompt)
                 targets.append(answer)
+
+        return inputs, targets
+
+    def _generate_mode_std_eval_set(
+        self,
+        n: int,
+        seed: int
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Generate fixed MODE:STD evaluation set.
+
+        Format matches ContextSwitchedMathDataset:
+        "MODE:STD | 5 + 3 =" -> "8"
+        """
+        rng = random.Random(seed)
+        inputs = []
+        targets = []
+
+        for _ in range(n):
+            op = rng.choice(['+', '-', '*'])
+            a = rng.randint(0, 99)
+            b = rng.randint(0, 99)
+
+            if op == '+':
+                result = a + b
+            elif op == '-':
+                result = a - b
+            else:
+                result = a * b
+
+            inputs.append(f"MODE:STD | {a} {op} {b} =")
+            targets.append(str(result))
+
+        return inputs, targets
+
+    def _generate_mode_mod7_eval_set(
+        self,
+        n: int,
+        seed: int,
+        modulus: int = 7
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Generate fixed MODE:MOD7 evaluation set.
+
+        Format matches ContextSwitchedMathDataset with mode=MOD7:
+        "MODE:MOD7 | 5 + 3 =" -> "1" (8 mod 7)
+        """
+        rng = random.Random(seed)
+        inputs = []
+        targets = []
+
+        for _ in range(n):
+            op = rng.choice(['+', '-', '*'])
+            a = rng.randint(0, 99)
+            b = rng.randint(0, 99)
+
+            if op == '+':
+                raw_result = a + b
+            elif op == '-':
+                raw_result = a - b
+            else:
+                raw_result = a * b
+
+            result = raw_result % modulus
+
+            inputs.append(f"MODE:MOD7 | {a} {op} {b} =")
+            targets.append(str(result))
 
         return inputs, targets
 
@@ -420,9 +550,11 @@ class IDForgettingBenchmark:
         experiment_type: One of "ID-Semantic", "ID-Syntactic", "ID-Context"
     """
 
-    # Word lists for syntactic experiments
+    # Word lists for syntactic experiments (must match SVO/OVS datasets)
     NOUNS = ['dog', 'cat', 'fox', 'bird', 'mouse', 'bear', 'fish', 'frog', 'wolf', 'deer']
-    VERBS = ['chases', 'sees', 'follows', 'finds', 'catches']
+    # Past tense and past participle forms (matching nlp_datasets.py TRANSITIVE_VERBS)
+    VERBS_PAST = ['chased', 'followed', 'watched', 'helped', 'found', 'caught', 'saw', 'heard']
+    VERBS_PARTICIPLE = ['chased', 'followed', 'watched', 'helped', 'found', 'caught', 'seen', 'heard']
 
     def __init__(
         self,
@@ -480,12 +612,17 @@ class IDForgettingBenchmark:
 
     def _generate_semantic_eval_set(self, rng: random.Random, n: int):
         """
-        Generate ID-Semantic evaluation set: math problems with standard vs modular targets.
+        Generate ID-Semantic evaluation set: MODE-prefixed math problems.
+
+        For ID-Semantic tests, we use MODE:STD prefix since:
+        - Task A trains on MODE:STD only
+        - Task B trains on mixed MODE:STD + MODE:MOD7
+        - We measure if MODE:STD accuracy degrades after mixed training
 
         Example:
-            Input: "5 + 3 ="
-            standard_target: "8"
-            modular_target: "1" (mod 7)
+            Input: "MODE:STD | 5 + 3 ="
+            standard_target: "8" (correct for MODE:STD)
+            modular_target: "1" (what MOD7 would produce - for comparison)
         """
         for _ in range(n):
             op = rng.choice(['+', '-', '*'])
@@ -501,31 +638,44 @@ class IDForgettingBenchmark:
 
             mod_result = std_result % self.modulus
 
-            self.shared_inputs.append(f"{a} {op} {b} =")
+            # Use MODE:STD prefix to match training data format
+            self.shared_inputs.append(f"MODE:STD | {a} {op} {b} =")
             self.standard_targets.append(str(std_result))
             self.modular_targets.append(str(mod_result))
 
     def _generate_syntactic_eval_set(self, rng: random.Random, n: int):
         """
-        Generate ID-Syntactic evaluation set: sentences with SVO vs OVS subject extraction.
+        Generate ID-Syntactic evaluation set: SVO vs OVS subject extraction.
 
-        Example:
-            Input: "the cat chased the mouse |"
-            standard_target: "cat" (SVO - first noun is subject)
-            modular_target: "mouse" (OVS - second noun is subject)
+        For SVO (Task A): "the cat chased the mouse | SUBJ:" -> "cat"
+        For OVS (Task B): "the mouse was chased by the cat | SUBJ:" -> "cat"
+
+        We evaluate both formats:
+        - standard_targets: SVO format subject identification
+        - modular_targets: OVS format (passive) subject identification
+
+        Note: In OVS passive voice "X was VERBed by Y", Y is the subject (doer).
         """
         for _ in range(n):
             # Pick two different nouns
-            noun1 = rng.choice(self.NOUNS)
-            noun2 = rng.choice([n for n in self.NOUNS if n != noun1])
-            verb = rng.choice(self.VERBS)
+            subject = rng.choice(self.NOUNS)
+            obj = rng.choice([n for n in self.NOUNS if n != subject])
+            # Use past tense for SVO
+            verb_past = rng.choice(self.VERBS_PAST)
+            # Use past participle for OVS passive (most are the same form)
+            verb_idx = self.VERBS_PAST.index(verb_past)
+            verb_participle = self.VERBS_PARTICIPLE[verb_idx]
 
-            # Format: "the {noun1} {verb} the {noun2} |"
-            self.shared_inputs.append(f"the {noun1} {verb} the {noun2} |")
-            # SVO: first noun is the subject
-            self.standard_targets.append(noun1)
-            # OVS: second noun is the subject (object-verb-subject order)
-            self.modular_targets.append(noun2)
+            # SVO format: "the {subject} {verb_past} the {obj} | SUBJ:"
+            # Expected answer: subject (the first noun, who did the action)
+            self.shared_inputs.append(f"the {subject} {verb_past} the {obj} | SUBJ:")
+            self.standard_targets.append(subject)
+
+            # For OVS, we still expect "subject" as the answer since that's who
+            # is doing the action. The difference is the format/word order.
+            # OVS passive: "the {obj} was {verb_participle} by the {subject} | SUBJ:"
+            # The model must learn that in passive voice, the BY-agent is the subject.
+            self.modular_targets.append(subject)
 
     def _generate_context_eval_set(self, rng: random.Random, n: int):
         """

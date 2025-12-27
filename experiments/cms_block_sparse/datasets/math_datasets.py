@@ -487,6 +487,110 @@ class ContextSwitchedMathDataset(IterableDataset):
             yield {"input_ids": input_ids, "labels": labels}
 
 
+class MixedModeMathDataset(IterableDataset):
+    """
+    Mixed-mode math dataset for ID-semantic forgetting tests.
+
+    Interleaves MODE:STD and MODE:MOD7 problems in each batch:
+    - "MODE:STD | 5 + 3 = 8"
+    - "MODE:MOD7 | 5 + 3 = 1"
+    - "MODE:STD | 12 * 4 = 48"
+    - "MODE:MOD7 | 7 - 2 = 5"
+
+    This tests whether the model can learn to distinguish modes when
+    both are present in training, rather than sequential replacement.
+
+    Attributes:
+        tokenizer: Extended MathTokenizer (with MODE tokens)
+        seq_length: Maximum sequence length
+        modulus: Modulo value for MOD7 mode (default 7)
+        std_ratio: Ratio of STD problems (default 0.5 = 50/50 mix)
+    """
+
+    def __init__(
+        self,
+        tokenizer: MathTokenizer,
+        seq_length: int = 128,
+        seed: Optional[int] = None,
+        modulus: int = 7,
+        max_num: int = 99,
+        std_ratio: float = 0.5,
+    ):
+        """
+        Initialize MixedModeMathDataset.
+
+        Args:
+            tokenizer: MathTokenizer with extended=True
+            seq_length: Maximum sequence length
+            seed: Random seed for reproducibility
+            modulus: Modulo value for MOD7 mode
+            max_num: Maximum number for operands
+            std_ratio: Ratio of STD problems (0.0-1.0)
+        """
+        if not tokenizer.extended:
+            raise ValueError("MixedModeMathDataset requires extended tokenizer")
+
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.rng = random.Random(seed)
+        self.modulus = modulus
+        self.max_num = max_num
+        self.std_ratio = std_ratio
+
+    def _generate_problem(self) -> str:
+        """Generate a mode-prefixed math problem (randomly STD or MOD7)."""
+        op = self.rng.choice(['+', '-', '*'])
+
+        a = self.rng.randint(0, self.max_num)
+        b = self.rng.randint(0, self.max_num)
+
+        if op == '+':
+            raw_result = a + b
+        elif op == '-':
+            raw_result = a - b
+        else:
+            raw_result = a * b
+
+        # Randomly choose mode
+        if self.rng.random() < self.std_ratio:
+            mode = "STD"
+            result = raw_result
+        else:
+            mode = "MOD7"
+            result = raw_result % self.modulus
+
+        return f"MODE:{mode} | {a} {op} {b} = {result}"
+
+    def __iter__(self) -> Iterator[dict]:
+        """Yield tokenized mixed-mode math problems."""
+        while True:
+            problems = []
+            total_chars = 0
+
+            while total_chars < self.seq_length * 2:
+                problem = self._generate_problem()
+                problems.append(problem)
+                total_chars += len(problem) + 3
+
+            text = " | ".join(problems)
+
+            encoded = self.tokenizer(
+                text,
+                max_length=self.seq_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            input_ids = encoded["input_ids"].squeeze(0)
+            attention_mask = encoded["attention_mask"].squeeze(0)
+
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+
+            yield {"input_ids": input_ids, "labels": labels}
+
+
 def generate_fixed_eval_inputs(
     n: int = 500,
     seed: int = 42,

@@ -59,7 +59,7 @@ from titans_core.models.titanmac import TitanMAC
 from datasets import (
     MathDataset, ModularMathDataset, MathTokenizer,
     SyntheticNLPDataset, NLPTokenizer,
-    SVODataset, OVSDataset, ContextSwitchedMathDataset,
+    SVODataset, OVSDataset, ContextSwitchedMathDataset, MixedModeMathDataset,
 )
 from configs import get_config, ExperimentConfig
 from benchmarks import ForgettingBenchmark, IDForgettingBenchmark, benchmark_step, benchmark_memory
@@ -153,6 +153,14 @@ def create_dataset(
             seed=seed,
             mode="MOD7",
             **filtered_params,
+        )
+    elif task_type == "mixed":
+        # Mixed mode: interleaves MODE:STD and MODE:MOD7 problems
+        return MixedModeMathDataset(
+            tokenizer=tokenizer,
+            seq_length=config.seq_length,
+            seed=seed,
+            **params,
         )
     else:
         raise ValueError(f"Unknown task type: {task_type}")
@@ -374,7 +382,7 @@ def run_dense_sequential(
     else:
         tokenizer_a = NLPTokenizer()
 
-    if config.task_b_type in ["mode_std", "mode_mod7"]:
+    if config.task_b_type in ["mode_std", "mode_mod7", "mixed"]:
         tokenizer_b = MathTokenizer(extended=True)
     elif config.task_b_type in ["nlp", "svo", "ovs"]:
         tokenizer_b = NLPTokenizer()

@@ -98,7 +98,7 @@ class ExperimentConfig:
     n_heads: int = 10    # head_dim = 64
     n_layers: int = 12   # ~60M params with d_model=640
     d_ff: int = 2560     # 4x d_model, 160 × 16
-    vocab_size: int = 89  # Combined math + NLP vocab
+    vocab_size: int = 100  # Combined math + NLP vocab (IDs 0-99)
 
     # Optimizer parameters
     optimizer: str = "deep_nested"
@@ -177,7 +177,7 @@ OOD_MATH_NLP = ExperimentConfig(
     seq_length=256,
 
     # Model
-    vocab_size=89,  # math (19) + nlp (70)
+    vocab_size=100,  # math (19) + nlp tokens (IDs up to 99)
 
     # Sparse
     use_sparse=True,
@@ -194,18 +194,20 @@ OOD_MATH_NLP = ExperimentConfig(
 ID_SEMANTIC_MODULAR = ExperimentConfig(
     name="id_semantic_modular",
     description=(
-        "In-distribution semantic forgetting: Standard arithmetic then "
-        "modular arithmetic (mod 7). Same inputs (e.g., '5 + 3 =') must "
-        "produce different outputs (8 vs 1). Tests whether topology can "
-        "learn to separate identical inputs based on training context."
+        "In-distribution semantic forgetting: Train MODE:STD only, then "
+        "train on mixed MODE:STD + MODE:MOD7 interleaved. Tests whether "
+        "the model can learn to distinguish modes and maintain MODE:STD "
+        "accuracy when also learning MODE:MOD7."
     ),
     experiment_type="ID-Semantic",
 
     # Tasks
-    task_a_type="math",
-    task_b_type="modular",
+    # Task A: MODE:STD only (standard arithmetic with mode prefix)
+    # Task B: Mixed (MODE:STD + MODE:MOD7 interleaved)
+    task_a_type="mode_std",
+    task_b_type="mixed",
     task_a_params={"max_num": 99},
-    task_b_params={"modulus": 7, "max_num": 99},
+    task_b_params={"modulus": 7, "max_num": 99, "std_ratio": 0.5},
 
     # Training
     steps_a=10000,
@@ -214,7 +216,7 @@ ID_SEMANTIC_MODULAR = ExperimentConfig(
     seq_length=256,
 
     # Model
-    vocab_size=19,  # math only
+    vocab_size=50,  # extended math vocab with MODE tokens
 
     # Sparse
     use_sparse=True,
@@ -251,7 +253,7 @@ ID_SYNTACTIC_GRAMMAR = ExperimentConfig(
     seq_length=256,
 
     # Model
-    vocab_size=89,  # Combined vocab for NLP
+    vocab_size=100,  # Combined vocab for NLP (IDs up to 99)
 
     # Sparse
     use_sparse=True,
